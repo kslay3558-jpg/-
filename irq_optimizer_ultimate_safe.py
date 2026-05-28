@@ -1,10 +1,12 @@
 import ctypes
 import json
 import os
+import queue
 import re
 import subprocess
 import sys
 import tempfile
+import threading
 from datetime import datetime
 
 import tkinter as tk
@@ -1068,50 +1070,64 @@ $output | Sort-Object Name | ConvertTo-Json -Depth 3
         self.device_entries = []
         self.device_roles = {}
         self.tree_item_by_instance = {}
-        try:
-            result = self._run_powershell(self._device_query_script())
-            if result.returncode != 0:
-                raise RuntimeError(result.stderr.strip() or "Failed to query devices")
-            payload = result.stdout.strip()
-            if not payload:
-                raise RuntimeError("No devices returned")
-            data = json.loads(payload)
-            if isinstance(data, dict):
-                data = [data]
+        result_queue: queue.Queue = queue.Queue()
 
-            for item in data:
-                name = item.get("Name") or "(Unnamed Device)"
-                cls = item.get("PNPClass") or "Unknown"
-                instance = item.get("PNPDeviceID")
-                parent = item.get("ParentInstanceId")
-                if not instance:
-                    continue
-                self.device_entries.append(
-                    {"name": name, "class": cls, "instance": instance, "parent": parent}
-                )
+        def _worker():
+            try:
+                result = self._run_powershell(self._device_query_script())
+                if result.returncode != 0:
+                    raise RuntimeError(result.stderr.strip() or "Failed to query devices")
+                payload = result.stdout.strip()
+                if not payload:
+                    raise RuntimeError("No devices returned")
+                data = json.loads(payload)
+                if isinstance(data, dict):
+                    data = [data]
+                entries = []
+                for item in data:
+                    name = item.get("Name") or "(Unnamed Device)"
+                    cls = item.get("PNPClass") or "Unknown"
+                    instance = item.get("PNPDeviceID")
+                    parent = item.get("ParentInstanceId")
+                    if not instance:
+                        continue
+                    entries.append(
+                        {"name": name, "class": cls, "instance": instance, "parent": parent}
+                    )
+                result_queue.put(("ok", entries))
+            except Exception as exc:
+                result_queue.put(("err", exc))
 
-            self.device_roles = self.build_device_role_map(self.device_entries)
-            for entry in self.device_entries:
-                instance = entry["instance"]
-                roles = self.device_roles.get(self._normalize_instance_id(instance), set())
-                label = self.role_label(roles)
-                disp_name = f"[{label}] {entry['name']}" if label else entry["name"]
-                tag = self._get_device_tag(roles)
-                item_id = self.tree.insert(
-                    "", "end",
-                    values=(disp_name, entry["class"], instance),
-                    tags=(tag,) if tag else (),
-                )
-                self.tree_item_by_instance[instance] = item_id
-
-            self.update_recommendation_text()
-
-            self.status_var.set(f"Loaded {len(self.tree.get_children())} devices")
-        except Exception as exc:
-            self.status_var.set("Failed to load devices")
-            messagebox.showerror("Device load failed", str(exc))
-        finally:
+        def _on_done():
+            try:
+                kind, value = result_queue.get_nowait()
+            except queue.Empty:
+                self.root.after(50, _on_done)
+                return
+            if kind == "err":
+                self.status_var.set("Failed to load devices")
+                messagebox.showerror("Device load failed", str(value))
+            else:
+                self.device_entries = value
+                self.device_roles = self.build_device_role_map(self.device_entries)
+                for entry in self.device_entries:
+                    instance = entry["instance"]
+                    roles = self.device_roles.get(self._normalize_instance_id(instance), set())
+                    label = self.role_label(roles)
+                    disp_name = f"[{label}] {entry['name']}" if label else entry["name"]
+                    tag = self._get_device_tag(roles)
+                    item_id = self.tree.insert(
+                        "", "end",
+                        values=(disp_name, entry["class"], instance),
+                        tags=(tag,) if tag else (),
+                    )
+                    self.tree_item_by_instance[instance] = item_id
+                self.update_recommendation_text()
+                self.status_var.set(f"Loaded {len(self.tree.get_children())} devices")
             self._stop_busy()
+
+        threading.Thread(target=_worker, daemon=True).start()
+        self.root.after(100, _on_done)
 
     def on_device_select(self, _event=None):
         selected = self.tree.selection()
@@ -1169,7 +1185,7 @@ $output | Sort-Object Name | ConvertTo-Json -Depth 3
         try:
             cores = self.get_selected_cores()
             mask_int = self.mask_from_cores(cores)
-            assignment_bytes = mask_int.to_bytes(max(1, (mask_int.bit_length() + 7) // 8), "little")
+            assignment_bytes = mask_int.to_bytes(8, "little")
 
             current_state = self.read_affinity_values(self.current_instance_id)
             self.backup_current_state(self.current_instance_id, current_state, mask_int, cores)
