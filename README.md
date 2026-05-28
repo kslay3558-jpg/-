@@ -141,9 +141,9 @@ C:\ProgramData\IRQOptimizer\irq_backup.json
 
 | 분기 | 해당 CPU | 배치 전략 |
 |---|---|---|
-| `intel_hybrid` | 12세대 이상 Core, Core Ultra | GPU → P-코어 중심 + 전반 코어 과집중 방지(후반 포함), 오디오/NIC → 비중첩 코어 |
+| `intel_hybrid` | 12세대 이상 Core, Core Ultra | GPU/오디오 → 물리 P-코어 우선, NIC/스토리지 → 분리 사이드 코어 우선 |
 | `intel_legacy` | 11세대 이하 Core | GPU → 주 로컬리티 중심 + 후반 코어 우선 편향, 오디오/NIC → 분리 배치 |
-| `amd_dual_x3d` | Ryzen 7950X3D / 9950X3D 등 | GPU → CCD0 중심 + 후반 코어 포함, 오디오/NIC → CCD1 우선 |
+| `amd_dual_x3d` | Ryzen 7950X3D / 9950X3D 등 | GPU/오디오 → CCD0 우선, NIC/스토리지 → CCD1 우선 |
 | `amd_single_x3d` | Ryzen 5800X3D / 7800X3D 등 | GPU → X3D 인접 + 후반 코어 편향, 오디오/NIC → 나머지 코어 |
 | `amd_generic` | 그 외 Ryzen / Threadripper | GPU → 주 로컬리티 후반 우선, 오디오/NIC → 분리 배치 |
 

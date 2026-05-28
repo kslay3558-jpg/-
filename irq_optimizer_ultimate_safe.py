@@ -276,6 +276,7 @@ class IRQOptimizerApp:
 
     def get_topology_snapshot(self):
         logical_guess = max(1, os.cpu_count() or 1)
+        physical_guess = max(1, min(self.MAX_GROUP_CORES, logical_guess // 2 if logical_guess > 1 else 1))
         fallback = {
             "api_available": False,
             "topology_source": "Fallback heuristic",
@@ -292,8 +293,8 @@ class IRQOptimizerApp:
             "numa_nodes": [],
             "summary": {
                 "group_count": 1,
-                "physical_core_count": 0,
-                "physical_core_count_group0": 0,
+                "physical_core_count": physical_guess,
+                "physical_core_count_group0": physical_guess,
                 "logical_processor_count": logical_guess,
                 "logical_processor_count_group0": min(logical_guess, self.MAX_GROUP_CORES),
                 "numa_node_count": 1,
@@ -303,10 +304,10 @@ class IRQOptimizerApp:
             "socket_count": 1,
             "numa_node_count": 1,
             "numa_logical_processors": [min(logical_guess, self.MAX_GROUP_CORES)],
-            "locality_groups": [list(range(min(max(1, logical_guess // 2), self.MAX_GROUP_CORES)))],
+            "locality_groups": [list(range(physical_guess))],
             "primary_group": [0],
             "secondary_group": [1] if logical_guess > 1 else [],
-            "group0_representative_logical_processors": list(range(min(logical_guess, self.MAX_GROUP_CORES))),
+            "group0_representative_logical_processors": list(range(physical_guess)),
             "group0_efficiency_by_logical_processor": {},
             "performance_core_count": 0,
             "efficiency_core_count": 0,
@@ -438,6 +439,7 @@ class IRQOptimizerApp:
         gpu_cores = []
         gpu_root_cores = []
         side_cores = []
+        audio_cores = []
         branch = self.cpu_arch
         reason = "기본 보수 배치 규칙이 적용되었습니다."
 
@@ -481,14 +483,23 @@ class IRQOptimizerApp:
                 or _tail_biased(e_cores, 3, tail_ratio=0.5)
                 or _tail_biased([x for x in p_cores if x not in gpu_cores], 3, tail_ratio=0.5)
             )
-            reason = "Intel 하이브리드 분기: 초반 P코어 과집중을 피하도록 후반 코어를 약하게 우선하는 P코어 인식 배치를 적용했습니다."
+            audio_cores = (
+                _tail_biased([x for x in p_primary if x not in gpu_cores], 3, tail_ratio=0.5)
+                or _tail_biased([x for x in p_cores if x not in gpu_cores], 3, tail_ratio=0.5)
+                or gpu_cores[:]
+            )
+            reason = "Intel 하이브리드 분기: 물리 P-코어 기반 배치를 우선하고, 오디오는 GPU 경로와 동일한 P-코어 영역을 먼저 사용합니다."
         elif branch == "amd_dual_x3d":
             ccd0 = primary_locality or rep_lps[: max(1, len(rep_lps) // 2)]
             ccd1 = secondary_locality or [x for x in rep_lps if x not in ccd0]
             gpu_cores = _tail_biased(ccd0, min(6, len(ccd0)), tail_ratio=0.5)
             gpu_root_cores = _tail_biased([x for x in ccd0 if x not in gpu_cores], 2, tail_ratio=0.5) or gpu_cores[:1]
             side_cores = _tail_biased(ccd1, 3, tail_ratio=0.5) or _tail_biased([x for x in ccd0 if x not in gpu_cores], 3, tail_ratio=0.5)
-            reason = "AMD 듀얼 CCD/X3D 분기: 로컬리티 우선 분할과 GPU 관련 코어의 CCD0 후반 코어 약우선 규칙을 적용했습니다."
+            audio_cores = (
+                _tail_biased([x for x in ccd0 if x not in gpu_root_cores], min(4, len(ccd0)), tail_ratio=0.5)
+                or gpu_cores[:]
+            )
+            reason = "AMD 듀얼 CCD/X3D 분기: GPU와 오디오를 CCD0에 우선 배치하고, NIC/스토리지는 CCD1 분리를 우선합니다."
         elif branch in {"amd_single_x3d", "amd_generic"}:
             gpu_span = 6 if branch == "amd_single_x3d" else 4
             gpu_cores = _tail_biased(primary_locality, min(gpu_span, len(primary_locality)), tail_ratio=0.5)
@@ -496,6 +507,7 @@ class IRQOptimizerApp:
             side_cores = _tail_biased([x for x in rep_lps if x not in gpu_cores], 3, tail_ratio=0.5)
             if not side_cores:
                 side_cores = _tail_biased(primary_locality[::2], 3, tail_ratio=0.5)
+            audio_cores = side_cores[:]
             reason = "AMD 분기: GPU 근접성을 유지하면서 초반 코어 과집중을 줄이도록 후반 코어 약우선 규칙을 적용했습니다."
         elif branch == "intel_legacy":
             gpu_cores = _tail_biased(primary_locality, min(4, len(primary_locality)), tail_ratio=0.5)
@@ -503,6 +515,7 @@ class IRQOptimizerApp:
             side_cores = _tail_biased([x for x in rep_lps if x not in gpu_cores], 3, tail_ratio=0.5)
             if not side_cores:
                 side_cores = gpu_root_cores[:]
+            audio_cores = side_cores[:]
             reason = "Intel 레거시 분기: 주 로컬리티의 균일 물리 코어에 후반 코어 약우선 규칙으로 분산 배치했습니다."
         else:
             gpu_cores = _tail_biased(primary_locality, min(4, len(primary_locality)), tail_ratio=0.5)
@@ -510,6 +523,7 @@ class IRQOptimizerApp:
             side_cores = _tail_biased([x for x in rep_lps if x not in gpu_cores], 3, tail_ratio=0.5)
             if not side_cores:
                 side_cores = gpu_root_cores[:]
+            audio_cores = side_cores[:]
             reason = "미확인 CPU: 로컬리티 우선의 보수적 배치와 후반 코어 약우선 규칙을 적용했습니다."
 
         def _sanitize(values, fallback):
@@ -524,9 +538,10 @@ class IRQOptimizerApp:
         gpu_cores = _sanitize(gpu_cores, 0)
         gpu_root_cores = _sanitize(gpu_root_cores, gpu_cores[0])
         side_cores = _sanitize(side_cores, gpu_root_cores[0])
+        audio_cores = _sanitize(audio_cores, gpu_cores[0])
 
         base_cores = []
-        for core in gpu_cores + side_cores:
+        for core in gpu_cores + audio_cores:
             if core not in base_cores:
                 base_cores.append(core)
 
@@ -536,6 +551,7 @@ class IRQOptimizerApp:
             "gpu_cores": gpu_cores,
             "gpu_root_cores": gpu_root_cores,
             "side_cores": side_cores,
+            "audio_cores": audio_cores,
             "reason": reason,
         }
 
@@ -699,11 +715,35 @@ class IRQOptimizerApp:
         entries[instance_id] = entry
         self.save_backup(backup)
 
-    def get_recommended_cores(self):
+    def get_recommended_cores(self, instance_id=None):
         rec = self.recommendation_sets or {}
-        base = rec.get("base_cores")
-        if isinstance(base, list) and base:
-            return [x for x in base if isinstance(x, int) and 0 <= x < self.logical_processors] or [0]
+
+        def _normalize(values):
+            if not isinstance(values, list):
+                return []
+            return [x for x in values if isinstance(x, int) and 0 <= x < self.logical_processors]
+
+        if instance_id:
+            iid = self._normalize_instance_id(instance_id)
+            roles = self.device_roles.get(iid, set())
+            role_to_key = [
+                ("gpu", "gpu_cores"),
+                ("gpu_root_port", "gpu_root_cores"),
+                ("audio", "audio_cores"),
+                ("nic", "side_cores"),
+                ("storage", "side_cores"),
+                ("usb_controller", "side_cores"),
+                ("pcie_root_port", "gpu_root_cores"),
+            ]
+            for role, key in role_to_key:
+                if role in roles:
+                    picked = _normalize(rec.get(key))
+                    if picked:
+                        return picked
+
+        base = _normalize(rec.get("base_cores"))
+        if base:
+            return base
         return [0]
 
     @staticmethod
@@ -801,6 +841,7 @@ class IRQOptimizerApp:
         gpu_group = rec.get("gpu_cores", base)[: min(4, len(rec.get("gpu_cores", base)))] or [0]
         root_group = rec.get("gpu_root_cores", gpu_group[:1])[:2] or [gpu_group[0]]
         side_group = rec.get("side_cores", [x for x in base if x not in gpu_group][:2])[:3] or [gpu_group[0]]
+        audio_group = rec.get("audio_cores", side_group)[: min(4, len(rec.get("audio_cores", side_group)))] or [gpu_group[0]]
 
         labels = {
             "gpu": "GPU",
@@ -836,7 +877,8 @@ class IRQOptimizerApp:
             f"- GPU: 1차 근접 물리 코어 그룹 {gpu_group} 우선",
             f"- GPU 루트 포트: 동일 로컬리티 인접 코어 {root_group} 우선 (강제 단일 코어 중첩 회피)",
             f"- USB 컨트롤러: 경합이 낮은 인접 사이드 코어 {side_group} 우선",
-            f"- 오디오/스토리지/NIC: 가능하면 분리된 인접 사이드 코어 {side_group} 사용",
+            f"- 오디오: 저지연 경로 우선 코어 {audio_group} 사용",
+            f"- 스토리지/NIC: 가능하면 분리된 인접 사이드 코어 {side_group} 사용",
             "",
             f"근거: {rec.get('reason', '토폴로지 인식 휴리스틱 적용')} "
             "GPU와 PCIe 루트 포트를 동일 코어에 강제로 겹치면 IRQ 경합이 증가할 수 있습니다.",
@@ -1225,7 +1267,7 @@ class IRQOptimizerApp:
             self._core_tiles.append(btn)
             self.checkbuttons.append(btn)
 
-        self.recommended_cores = self.get_recommended_cores()
+        self.recommended_cores = self.get_recommended_cores(self.current_instance_id)
         self.highlight_recommendations()
 
     def _toggle_core(self, idx: int):
@@ -1442,6 +1484,7 @@ $output | Sort-Object Name | ConvertTo-Json -Depth 3
         for var in self.core_vars:
             var.set(False)
 
+        self.recommended_cores = self.get_recommended_cores(instance_id)
         self.highlight_recommendations()
 
         state = self.read_affinity_values(instance_id)
