@@ -1181,7 +1181,7 @@ class IRQOptimizerApp:
                 height=52,
                 corner_radius=6,
                 border_width=2,
-                border_color="transparent",
+                border_color=_TILE_NORMAL,
                 fg_color=_TILE_NORMAL,
                 hover_color=_TILE_HOVER,
                 command=lambda idx=i: self._toggle_core(idx),
@@ -1203,11 +1203,12 @@ class IRQOptimizerApp:
         selected      = self.core_vars[idx].get()
         is_recommended = idx in self.recommended_cores
 
-        btn.configure(fg_color=_TILE_SELECTED if selected else _TILE_NORMAL)
+        tile_color = _TILE_SELECTED if selected else _TILE_NORMAL
+        btn.configure(fg_color=tile_color)
         if is_recommended:
             btn.configure(border_color=_RECOMMEND_BORDER, border_width=2)
         else:
-            btn.configure(border_color="transparent", border_width=2)
+            btn.configure(border_color=tile_color, border_width=2)
 
     def highlight_recommendations(self):
         for i in range(len(self._core_tiles)):
