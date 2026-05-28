@@ -74,8 +74,13 @@ class WindowsTopologyReader:
     """Reads CPU topology from GetLogicalProcessorInformationEx and normalizes it."""
 
     def __init__(self):
-        self._kernel32 = getattr(ctypes, "windll", None)
-        self._kernel32 = self._kernel32.kernel32 if self._kernel32 else None
+        # use_last_error=True is important for reliable ERROR_INSUFFICIENT_BUFFER handling.
+        self._kernel32 = None
+        if hasattr(ctypes, "WinDLL"):
+            try:
+                self._kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            except Exception:
+                self._kernel32 = None
 
     @staticmethod
     def mask_to_logical_processors(mask, max_bits=64):
@@ -165,6 +170,8 @@ class WindowsTopologyReader:
 
     @staticmethod
     def _parse_processor_cores(raw):
+        # PROCESSOR_RELATIONSHIP is variable length (GroupMask[ANYSIZE_ARRAY]),
+        # so parse the fixed head first and then read GroupCount masks manually.
         cores = []
         head_size = ctypes.sizeof(SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX_HEADER)
         rel_head_size = ctypes.sizeof(PROCESSOR_RELATIONSHIP_HEAD)
@@ -198,6 +205,7 @@ class WindowsTopologyReader:
 
     @staticmethod
     def _parse_group_relation(raw):
+        # GROUP_RELATIONSHIP also has a trailing array of PROCESSOR_GROUP_INFO entries.
         groups = []
         head_size = ctypes.sizeof(SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX_HEADER)
         rel_head_size = ctypes.sizeof(GROUP_RELATIONSHIP_HEAD)
@@ -227,6 +235,7 @@ class WindowsTopologyReader:
 
     @staticmethod
     def _parse_numa_nodes_legacy(raw):
+        # Legacy NUMA relation has a single GROUP_AFFINITY mask.
         nodes = []
         head_size = ctypes.sizeof(SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX_HEADER)
         rel_size = ctypes.sizeof(NUMA_NODE_RELATIONSHIP_HEAD)
@@ -247,6 +256,7 @@ class WindowsTopologyReader:
 
     @staticmethod
     def _parse_numa_nodes_ex(raw):
+        # NUMA_NODE_RELATIONSHIP_EX is variable length (GroupMasks[GroupCount]).
         nodes = []
         head_size = ctypes.sizeof(SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX_HEADER)
         rel_head_size = ctypes.sizeof(NUMA_NODE_RELATIONSHIP_EX_HEAD)
