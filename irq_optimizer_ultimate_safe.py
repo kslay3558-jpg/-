@@ -3,6 +3,7 @@ import json
 import os
 import queue
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -89,6 +90,7 @@ class IRQOptimizerApp:
         self.device_roles = {}
         self.tree_item_by_instance = {}
         self.preference_profiles = self.build_preference_profiles()
+        self.powershell_executable = self._resolve_powershell_executable()
 
         program_data = os.environ.get("ProgramData", r"C:\ProgramData")
         backup_dir = os.path.join(program_data, "IRQOptimizer")
@@ -97,7 +99,9 @@ class IRQOptimizerApp:
 
         self.cpu_info = self.get_cpu_info()
         self.physical_cores, self.logical_processors = self.get_core_counts()
+        self.original_logical_processors = self.logical_processors
         self.logical_processors = max(1, min(self.logical_processors, self.MAX_GROUP_CORES))
+        self.group_limit_active = self.original_logical_processors > self.MAX_GROUP_CORES
         self.is_smt_enabled = self.logical_processors > self.physical_cores
         self.cpu_arch = self.classify_cpu()
         self.locality_groups = self.build_locality_groups()
@@ -105,18 +109,39 @@ class IRQOptimizerApp:
         self.recommendation_sets = self.derive_topology_recommendation()
 
         self.create_widgets()
+        if self.group_limit_active:
+            self.status_var.set(
+                "Only processor group 0 is supported. Logical processors above 63 are hidden."
+            )
         self.load_devices()
+
+    def _resolve_powershell_executable(self):
+        for candidate in ("powershell.exe", "pwsh.exe", "powershell", "pwsh"):
+            if shutil.which(candidate):
+                return candidate
+        return "powershell.exe"
 
     def _run_powershell(self, script):
         flags = 0
         if hasattr(subprocess, "CREATE_NO_WINDOW"):
             flags = subprocess.CREATE_NO_WINDOW
-        return subprocess.run(
-            ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", script],
-            capture_output=True,
-            text=True,
-            creationflags=flags,
-        )
+        command = self.powershell_executable or "powershell.exe"
+        try:
+            return subprocess.run(
+                [command, "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", script],
+                capture_output=True,
+                text=True,
+                creationflags=flags,
+            )
+        except FileNotFoundError:
+            if command.lower() != "pwsh.exe":
+                return subprocess.run(
+                    ["pwsh.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", script],
+                    capture_output=True,
+                    text=True,
+                    creationflags=flags,
+                )
+            raise
 
     def get_cpu_info(self):
         try:
@@ -231,10 +256,12 @@ class IRQOptimizerApp:
             "locality_groups": [list(g) for g in self.locality_groups],
             "primary_group": list(self.locality_groups[0]) if self.locality_groups else [0],
             "secondary_group": list(self.locality_groups[1][:2]) if len(self.locality_groups) > 1 else [],
+            "performance_core_count": 0,
+            "efficiency_core_count": 0,
         }
         try:
             script = r"""
-$processors = Get-CimInstance Win32_Processor | Select-Object Name,Manufacturer,NumberOfCores,NumberOfLogicalProcessors
+$processors = Get-CimInstance Win32_Processor | Select-Object Name,Manufacturer,NumberOfCores,NumberOfLogicalProcessors,NumberOfPerformanceCores,NumberOfEfficiencyCores
 $numa = Get-CimInstance Win32_NumaNode | Select-Object NodeNumber,NumberOfLogicalProcessors
 [PSCustomObject]@{
   Processors = $processors
@@ -269,6 +296,9 @@ $numa = Get-CimInstance Win32_NumaNode | Select-Object NodeNumber,NumberOfLogica
             snapshot["numa_logical_processors"] = (
                 numa_nodes if numa_nodes else [self.logical_processors]
             )
+            if isinstance(procs, list):
+                snapshot["performance_core_count"] = sum(int(x.get("NumberOfPerformanceCores", 0) or 0) for x in procs)
+                snapshot["efficiency_core_count"] = sum(int(x.get("NumberOfEfficiencyCores", 0) or 0) for x in procs)
             return snapshot
         except Exception:
             return fallback
@@ -310,13 +340,26 @@ $numa = Get-CimInstance Win32_NumaNode | Select-Object NodeNumber,NumberOfLogica
         reason = "Fallback conservative placement was applied."
 
         if branch == "intel_hybrid":
-            p_core_count = max(2, min(phys_limit, (phys_limit * 2) // 3))
+            reported_p_cores = int(topo.get("performance_core_count", 0) or 0)
+            reported_e_cores = int(topo.get("efficiency_core_count", 0) or 0)
+            if reported_p_cores > 0:
+                p_core_count = max(1, min(phys_limit, reported_p_cores))
+            elif reported_e_cores > 0:
+                p_core_count = max(1, min(phys_limit, phys_limit - reported_e_cores))
+            else:
+                p_core_count = max(2, min(phys_limit, (phys_limit * 2) // 3))
             p_cores = physical_cores[:p_core_count]
             e_cores = [x for x in physical_cores if x not in p_cores]
             gpu_cores = p_cores[: min(6, len(p_cores))] or primary_locality[: min(4, len(primary_locality))]
             gpu_root_cores = p_cores[1:3] or gpu_cores[:1]
             side_cores = e_cores[:3] or [x for x in p_cores if x not in gpu_cores][:3]
-            reason = "Intel hybrid branch: GPU favors P-core cluster, side devices prefer E-core/adjacent cores."
+            if reported_p_cores > 0 or reported_e_cores > 0:
+                reason = (
+                    "Intel hybrid branch: used OS-reported P/E core counts for primary placement; "
+                    "GPU favors P-core cluster, side devices prefer E-core/adjacent cores."
+                )
+            else:
+                reason = "Intel hybrid branch: GPU favors P-core cluster, side devices prefer E-core/adjacent cores."
         elif branch == "amd_dual_x3d":
             ccd0 = primary_locality or physical_cores[: max(1, phys_limit // 2)]
             ccd1 = secondary_locality or [x for x in physical_cores if x not in ccd0]
@@ -383,11 +426,14 @@ $numa = Get-CimInstance Win32_NumaNode | Select-Object NodeNumber,NumberOfLogica
         rec = self.recommendation_sets or {}
         guide = (
             f"CPU: {self.cpu_info}\n"
-            f"Cores: Physical {self.physical_cores} / Logical {self.logical_processors}\n"
+            f"Cores: Physical {self.physical_cores} / Logical {self.logical_processors}"
+            f"{f' (detected {self.original_logical_processors}, group 0 view)' if self.group_limit_active else ''}\n"
             f"SMT/HT: {smt}\n"
             f"Architecture profile: {self.cpu_arch}\n"
             f"Recommendation branch: {rec.get('branch', self.cpu_arch)}\n"
             f"Sockets: {topo.get('socket_count', 1)}, NUMA nodes: {topo.get('numa_node_count', 1)}\n"
+            f"Reported P-cores: {topo.get('performance_core_count', 0)}, "
+            f"E-cores: {topo.get('efficiency_core_count', 0)}\n"
             f"Locality groups: {topo.get('locality_groups', self.locality_groups)}\n\n"
         )
         msg = {
@@ -437,8 +483,7 @@ $numa = Get-CimInstance Win32_NumaNode | Select-Object NodeNumber,NumberOfLogica
 
     def write_affinity_values(self, instance_id, assignment_bytes, device_policy=4):
         reg_path = self.get_reg_path(instance_id)
-        winreg.CreateKey(winreg.HKEY_LOCAL_MACHINE, reg_path)
-        with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, reg_path, 0, winreg.KEY_SET_VALUE) as key:
+        with winreg.CreateKeyEx(winreg.HKEY_LOCAL_MACHINE, reg_path, 0, winreg.KEY_SET_VALUE) as key:
             winreg.SetValueEx(key, "DevicePolicy", 0, winreg.REG_DWORD, int(device_policy))
             winreg.SetValueEx(key, "AssignmentSetOverride", 0, winreg.REG_BINARY, assignment_bytes)
 
@@ -533,7 +578,7 @@ $numa = Get-CimInstance Win32_NumaNode | Select-Object NodeNumber,NumberOfLogica
         inst_l = self._normalize_instance_id(instance_id)
         roles = set()
 
-        gpu_keys = ("nvidia", "geforce", "rtx", "gtx", "quadro", "radeon", "amd", "arc")
+        gpu_keys = ("nvidia", "geforce", "rtx", "gtx", "quadro", "radeon", "rx ", "arc")
         if cls_l == "display" or any(k in name_l for k in gpu_keys):
             roles.add("gpu")
 
@@ -649,6 +694,10 @@ $numa = Get-CimInstance Win32_NumaNode | Select-Object NodeNumber,NumberOfLogica
             f"Reasoning: {rec.get('reason', 'Topology-aware branch policy applied.')} "
             "Forcing GPU and PCIe Root Port onto one identical core can increase IRQ contention.",
         ]
+        if self.group_limit_active:
+            lines.append(
+                "Warning: Only processor group 0 is supported. Logical processors above 63 are hidden."
+            )
         return "\n".join(lines)
 
     def update_recommendation_text(self):
@@ -838,7 +887,7 @@ $numa = Get-CimInstance Win32_NumaNode | Select-Object NodeNumber,NumberOfLogica
         tree_wrap.rowconfigure(0, weight=1)
 
         columns = ("Name", "Class", "InstanceID")
-        self.tree = ttk.Treeview(tree_wrap, columns=columns, show="headings", height=12)
+        self.tree = ttk.Treeview(tree_wrap, columns=columns, show="headings", height=12, selectmode="extended")
         self.tree.heading("Name", text="Device")
         self.tree.heading("Class", text="Class")
         self.tree.heading("InstanceID", text="InstanceID")
@@ -862,7 +911,7 @@ $numa = Get-CimInstance Win32_NumaNode | Select-Object NodeNumber,NumberOfLogica
 
         ctk.CTkLabel(
             core_outer,
-            text="Core Selection  (Processor Group 0)",
+            text="Core Selection  (Processor Group 0, up to 64 logical CPUs)",
             font=ctk.CTkFont("Segoe UI", 12, "bold"),
         ).grid(row=0, column=0, sticky="w", padx=10, pady=(8, 4))
 
@@ -896,8 +945,8 @@ $numa = Get-CimInstance Win32_NumaNode | Select-Object NodeNumber,NumberOfLogica
             width=130, fg_color=("#dc2626", "#ef4444"), hover_color=("#b91c1c", "#dc2626"), **_BTN,
         ).pack(side=tk.LEFT, padx=3, pady=11)
         ctk.CTkButton(
-            right, text="✅  Apply",         command=self.apply_affinity,
-            width=110, fg_color=("#16a34a", "#22c55e"), hover_color=("#15803d", "#16a34a"),
+            right, text="✅  Apply to Selected", command=self.apply_affinity,
+            width=170, fg_color=("#16a34a", "#22c55e"), hover_color=("#15803d", "#16a34a"),
             font=ctk.CTkFont("Segoe UI", 13, "bold"), height=36, corner_radius=6,
         ).pack(side=tk.LEFT, padx=3, pady=11)
 
@@ -1123,7 +1172,10 @@ $output | Sort-Object Name | ConvertTo-Json -Depth 3
                     )
                     self.tree_item_by_instance[instance] = item_id
                 self.update_recommendation_text()
-                self.status_var.set(f"Loaded {len(self.tree.get_children())} devices")
+                status = f"Loaded {len(self.tree.get_children())} devices"
+                if self.group_limit_active:
+                    status += " (Group 0 only; LP > 63 hidden)"
+                self.status_var.set(status)
             self._stop_busy()
 
         threading.Thread(target=_worker, daemon=True).start()
@@ -1133,11 +1185,21 @@ $output | Sort-Object Name | ConvertTo-Json -Depth 3
         selected = self.tree.selection()
         if not selected:
             return
-        values = self.tree.item(selected[0], "values")
+        selected_item = self.tree.focus() if self.tree.focus() in selected else selected[0]
+        values = self.tree.item(selected_item, "values")
         if len(values) < 3:
             return
         self.current_instance_id = values[2]
         self.update_core_display_for_device(self.current_instance_id)
+
+    def get_selected_instance_ids(self):
+        selected_items = self.tree.selection()
+        selected_instances = []
+        for item in selected_items:
+            values = self.tree.item(item, "values")
+            if len(values) >= 3 and values[2] and values[2] not in selected_instances:
+                selected_instances.append(values[2])
+        return selected_instances
 
     def update_core_display_for_device(self, instance_id):
         for var in self.core_vars:
@@ -1151,6 +1213,10 @@ $output | Sort-Object Name | ConvertTo-Json -Depth 3
             self.status_var.set("Device selected (no custom IRQ mask set)")
             return
 
+        unusual_len_notice = ""
+        if len(assignment) not in (4, 8):
+            unusual_len_notice = f", unusual affinity length={len(assignment)} bytes"
+
         mask = int.from_bytes(assignment, byteorder="little", signed=False)
         for i, var in enumerate(self.core_vars):
             var.set(bool(mask & (1 << i)))
@@ -1158,7 +1224,7 @@ $output | Sort-Object Name | ConvertTo-Json -Depth 3
         for i in range(len(self._core_tiles)):
             self._refresh_tile(i)
 
-        self.status_var.set(f"Device selected (current mask: {hex(mask)})")
+        self.status_var.set(f"Device selected (current mask: {hex(mask)}{unusual_len_notice})")
 
     def get_selected_cores(self):
         selected = [i for i, var in enumerate(self.core_vars) if var.get()]
@@ -1177,8 +1243,19 @@ $output | Sort-Object Name | ConvertTo-Json -Depth 3
         return mask
 
     def apply_affinity(self):
-        if not self.current_instance_id:
-            messagebox.showwarning("No device", "Select a device first.")
+        selected_instances = self.get_selected_instance_ids()
+        if not selected_instances:
+            messagebox.showwarning("No device", "Select at least one device first.")
+            return
+
+        if not messagebox.askyesno(
+            "Confirm IRQ affinity change",
+            "This will modify HKLM registry IRQ affinity settings for the selected device(s).\n\n"
+            "Incorrect settings may cause USB/audio/network/storage/GPU instability until reverted.\n"
+            "Use Undo Last or Factory Reset if needed.\n\n"
+            f"Selected device count: {len(selected_instances)}\n\n"
+            "Continue?",
+        ):
             return
 
         self._start_busy()
@@ -1186,27 +1263,33 @@ $output | Sort-Object Name | ConvertTo-Json -Depth 3
             cores = self.get_selected_cores()
             mask_int = self.mask_from_cores(cores)
             assignment_bytes = mask_int.to_bytes(8, "little")
+            for instance_id in selected_instances:
+                current_state = self.read_affinity_values(instance_id)
+                self.backup_current_state(instance_id, current_state, mask_int, cores)
+                self.write_affinity_values(instance_id, assignment_bytes, device_policy=4)
 
-            current_state = self.read_affinity_values(self.current_instance_id)
-            self.backup_current_state(self.current_instance_id, current_state, mask_int, cores)
+                verify_state = self.read_affinity_values(instance_id)
+                verify_assignment = verify_state.get("assignment")
+                verify_policy = verify_state.get("device_policy")
+                if not isinstance(verify_assignment, (bytes, bytearray)):
+                    raise RuntimeError(
+                        f"Verification failed for {instance_id}: AssignmentSetOverride missing after write."
+                    )
+                if int.from_bytes(verify_assignment, "little") != mask_int:
+                    raise RuntimeError(
+                        f"Verification failed for {instance_id}: written IRQ mask does not match."
+                    )
+                if int(verify_policy) != 4:
+                    raise RuntimeError(f"Verification failed for {instance_id}: DevicePolicy is not 4.")
 
-            self.write_affinity_values(self.current_instance_id, assignment_bytes, device_policy=4)
-
-            verify_state = self.read_affinity_values(self.current_instance_id)
-            verify_assignment = verify_state.get("assignment")
-            verify_policy = verify_state.get("device_policy")
-            if not isinstance(verify_assignment, (bytes, bytearray)):
-                raise RuntimeError("Verification failed: AssignmentSetOverride missing after write.")
-            if int.from_bytes(verify_assignment, "little") != mask_int:
-                raise RuntimeError("Verification failed: written IRQ mask does not match.")
-            if int(verify_policy) != 4:
-                raise RuntimeError("Verification failed: DevicePolicy is not 4.")
-
-            self.update_core_display_for_device(self.current_instance_id)
-            self.status_var.set(f"Applied IRQ mask {hex(mask_int)} to selected device")
+            if self.current_instance_id and self.current_instance_id in selected_instances:
+                self.update_core_display_for_device(self.current_instance_id)
+            self.status_var.set(
+                f"Applied IRQ mask {hex(mask_int)} to {len(selected_instances)} selected device(s)"
+            )
             messagebox.showinfo(
                 "Success",
-                f"IRQ affinity applied. Mask: {hex(mask_int)}\n\n"
+                f"IRQ affinity applied to {len(selected_instances)} device(s). Mask: {hex(mask_int)}\n\n"
                 "⚠️ 변경 사항을 실제로 적용하려면 시스템을 재부팅하세요.",
             )
         except Exception as exc:
@@ -1242,6 +1325,8 @@ $output | Sort-Object Name | ConvertTo-Json -Depth 3
             verify_state = self.read_affinity_values(self.current_instance_id)
             if verify_state.get("had_affinity_key"):
                 raise RuntimeError("Factory reset verification failed: AssignmentSetOverride still exists.")
+            if verify_state.get("had_device_policy_key"):
+                raise RuntimeError("Factory reset verification failed: DevicePolicy still exists.")
 
             self.update_core_display_for_device(self.current_instance_id)
             self.status_var.set("Factory reset completed for selected device")
@@ -1287,8 +1372,7 @@ $output | Sort-Object Name | ConvertTo-Json -Depth 3
 
                 if had_device_policy_key and previous_policy is not None:
                     reg_path = self.get_reg_path(self.current_instance_id)
-                    winreg.CreateKey(winreg.HKEY_LOCAL_MACHINE, reg_path)
-                    with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, reg_path, 0, winreg.KEY_SET_VALUE) as key:
+                    with winreg.CreateKeyEx(winreg.HKEY_LOCAL_MACHINE, reg_path, 0, winreg.KEY_SET_VALUE) as key:
                         winreg.SetValueEx(key, "DevicePolicy", 0, winreg.REG_DWORD, int(previous_policy))
                 else:
                     try:

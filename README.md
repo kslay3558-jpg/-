@@ -53,7 +53,7 @@ python irq_optimizer_ultimate_safe.py
   - `Balanced` : 게임·작업 혼용 환경
   - `Low Latency` : 경쟁 게임 등 낮은 지연 우선
   - `Streaming` : 방송/녹화 병행 환경
-- **수동 선택:** 목록에서 장치를 직접 클릭해 선택합니다.
+- **수동 선택:** 목록에서 장치를 하나 이상 선택할 수 있으며, **Apply to Selected**는 현재 선택된 모든 장치에 동일한 마스크를 적용합니다.
 
 ### 3단계 — CPU 코어 지정
 
@@ -63,9 +63,9 @@ python irq_optimizer_ultimate_safe.py
 
 ### 4단계 — 적용 및 재부팅
 
-1. **Apply** 버튼을 클릭합니다.
-2. 앱이 현재 상태를 자동 백업한 뒤 레지스트리에 `DevicePolicy=4`와 `AssignmentSetOverride` 값을 기록합니다.
-3. 기록 즉시 검증이 이루어지며, 성공 또는 실패 메시지가 표시됩니다.
+1. **Apply to Selected** 버튼을 클릭합니다.
+2. 앱이 각 선택 장치의 현재 상태를 자동 백업한 뒤 레지스트리에 `DevicePolicy=4`와 `AssignmentSetOverride` 값을 기록합니다.
+3. 기록 즉시 장치별 검증이 이루어지며, 성공 또는 실패 메시지가 표시됩니다.
 4. ⚠️ **성공 메시지가 표시된 뒤에도 실제 적용은 시스템 재부팅 후에 이루어집니다. 반드시 재부팅하세요.**
 
 ### 5단계 — 효과 확인
@@ -77,8 +77,8 @@ python irq_optimizer_ultimate_safe.py
 
 | 버튼 | 동작 |
 |---|---|
-| **Undo Last** | 선택한 장치의 마지막 변경을 이전 상태로 되돌립니다 |
-| **Factory Reset** | 선택한 장치의 모든 커스텀 IRQ 값을 제거합니다 |
+| **Undo Last** | 현재 포커스(단일) 장치의 마지막 변경을 이전 상태로 되돌립니다 |
+| **Factory Reset** | 현재 포커스(단일) 장치의 모든 커스텀 IRQ 값을 제거합니다 |
 
 > 복구 후에도 **재부팅**해야 변경이 실제로 적용됩니다.
 
@@ -111,7 +111,7 @@ C:\ProgramData\IRQOptimizer\irq_backup.json
 
 - 반드시 **관리자 권한**으로 실행하세요. 레지스트리 쓰기에 필요합니다.
 - 한 번에 모든 장치를 변경하지 말고, GPU/오디오 등 핵심 장치부터 순차적으로 적용하세요.
-- Processor Group 0의 최대 64개 논리 코어 범위만 지원합니다.
+- Processor Group 0의 최대 64개 논리 코어 범위만 지원합니다. 64개를 초과하는 시스템에서는 63번 초과 논리 프로세서는 UI에서 숨겨집니다.
 - 오버클럭·언더볼팅·백그라운드 앱 상태에 따라 결과 편차가 발생할 수 있습니다.
 - **Apply, Undo Last, Factory Reset 모두 재부팅 후에 실제로 적용됩니다.**
 
