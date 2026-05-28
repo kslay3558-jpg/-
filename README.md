@@ -1,5 +1,10 @@
 # IRQ Optimizer (Ultimate Safe Edition)
 
+> **면책 조항 (Disclaimer)**  
+> 본 소프트웨어는 Windows 레지스트리(HKLM) 및 IRQ Affinity 정책을 변경합니다.  
+> 사용자의 시스템 환경에 따라 성능 저하, 장치 오동작, 시스템 불안정(BSoD 포함)이 발생할 수 있으며,  
+> **본 소프트웨어 사용으로 인해 발생하는 모든 문제에 대해 개발자는 책임지지 않습니다.**
+
 Windows 환경에서 GPU, 오디오, 스토리지, NIC 등 핵심 장치의 **IRQ Affinity(인터럽트 친화도)**를 직접 지정해  
 게임 중 입력 지연(Input Lag)과 프레임타임 흔들림(스터터링, 1% Low 저하)을 완화하는 도구입니다.
 
@@ -17,7 +22,7 @@ Windows 기본 스케줄러는 인터럽트를 모든 코어에 균일하게 분
 
 ## 요구 사항
 
-- Windows 10 또는 Windows 11
+- Windows 10 또는 Windows 11 (64-bit)
 - 관리자 권한 실행
 - Python 3.9 이상
 
@@ -36,6 +41,45 @@ python irq_optimizer_ultimate_safe.py
 ```
 
 권한이 부족한 경우 UAC 프롬프트가 자동으로 나타납니다.
+
+---
+
+## 릴리즈 빌드 (.exe)
+
+릴리즈 빌드는 명령행 옵션 조합 대신 저장소의 `build.spec` 기준으로 고정하는 것을 권장합니다.
+
+1. 관리자 권한 PowerShell 또는 CMD 실행
+2. 저장소 루트에서 아래 명령 실행
+
+```bash
+pip install pyinstaller customtkinter
+pyinstaller build.spec
+```
+
+출력 파일:
+
+```text
+dist\IRQOptimizer.exe
+```
+
+`build.spec`에는 다음 설정이 포함되어 있습니다.
+- 단일 실행 파일 (`onefile=True`)
+- 콘솔 창 비표시 (`console=False`)
+- 관리자 권한 요청 UAC 매니페스트 (`uac_admin=True`)
+- CustomTkinter 리소스 번들링
+
+---
+
+## 백신 오진(False Positive) 안내
+
+이 프로그램은 다음 특성으로 인해 일부 백신/보안 제품에서 오진될 수 있습니다.
+- 단일 파일 패키징 실행 구조(PyInstaller onefile)
+- 관리자 권한(UAC) 요청
+- PowerShell 기반 장치 정보 조회
+- HKLM 레지스트리 IRQ 정책 변경
+
+> 소스 코드는 공개되어 있으며, 동작 내용을 직접 검토할 수 있습니다.  
+> 릴리즈 배포 시에는 `RELEASE_TEMPLATE.md`의 안내 문구를 함께 사용하세요.
 
 ---
 
@@ -123,3 +167,12 @@ C:\ProgramData\IRQOptimizer\irq_backup.json
 
 - [`docs/guide.html`](docs/guide.html) — 상세 사용 가이드
 - [`docs/style.css`](docs/style.css) — 스타일 시트
+
+---
+
+## 스크린샷
+
+릴리즈 품질 향상을 위해 UI/결과 화면 스크린샷을 포함하세요.
+
+- 메인 UI (다크 모드) — `docs/images/ui-main-dark.png` (추가 예정)
+- 토폴로지/적용 결과 화면 — `docs/images/topology-result.png` (추가 예정)
