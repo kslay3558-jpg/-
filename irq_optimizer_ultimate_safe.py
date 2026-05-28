@@ -45,6 +45,9 @@ class IRQOptimizerApp:
         self.checkbuttons = []
         self.recommended_cores = []
         self.current_instance_id = None
+        self.device_entries = []
+        self.device_roles = {}
+        self.tree_item_by_instance = {}
 
         program_data = os.environ.get("ProgramData", r"C:\ProgramData")
         backup_dir = os.path.join(program_data, "IRQOptimizer")
@@ -263,6 +266,138 @@ class IRQOptimizerApp:
         rec = list(range(0, phys_limit, step))
         return rec or [0]
 
+    @staticmethod
+    def _normalize_instance_id(instance_id):
+        return (instance_id or "").strip().lower()
+
+    def classify_device_base_roles(self, name, pnp_class, instance_id):
+        name_l = (name or "").lower()
+        cls_l = (pnp_class or "").lower()
+        inst_l = self._normalize_instance_id(instance_id)
+        roles = set()
+
+        gpu_keys = ("nvidia", "geforce", "rtx", "gtx", "quadro", "radeon", "amd", "arc")
+        if cls_l == "display" or any(k in name_l for k in gpu_keys):
+            roles.add("gpu")
+
+        root_port_keys = ("root port", "root complex", "pcie root", "pci express root")
+        if cls_l == "system" and "pci" in name_l and any(k in name_l for k in root_port_keys):
+            roles.add("pcie_root_port")
+
+        audio_keys = ("audio", "hd audio", "high definition audio", "realtek", "sound")
+        if cls_l in {"media", "audioendpoint"} or any(k in name_l for k in audio_keys):
+            roles.add("audio")
+
+        storage_classes = {"diskdrive", "scsiadapter", "hdc", "ide", "storage"}
+        if cls_l in storage_classes or inst_l.startswith(("nvme\\", "scsi\\", "stor", "sata")):
+            roles.add("storage")
+
+        nic_keys = ("ethernet", "network", "wireless", "wi-fi", "wifi", "2.5gbe", "10gbe", "lan")
+        if cls_l == "net" or any(k in name_l for k in nic_keys):
+            roles.add("nic")
+
+        return roles
+
+    def build_device_role_map(self, entries):
+        role_map = {}
+        by_id = {self._normalize_instance_id(x["instance"]): x for x in entries}
+
+        for entry in entries:
+            iid = self._normalize_instance_id(entry["instance"])
+            role_map[iid] = self.classify_device_base_roles(entry["name"], entry["class"], entry["instance"])
+
+        root_port_ids = {iid for iid, roles in role_map.items() if "pcie_root_port" in roles}
+        gpu_ids = [iid for iid, roles in role_map.items() if "gpu" in roles]
+
+        for gpu_iid in gpu_ids:
+            current = gpu_iid
+            for _ in range(16):
+                parent = self._normalize_instance_id(by_id.get(current, {}).get("parent"))
+                if not parent:
+                    break
+                if parent in root_port_ids:
+                    role_map[parent].add("gpu_root_port")
+                    break
+                if parent == current:
+                    break
+                current = parent
+
+        return role_map
+
+    @staticmethod
+    def role_label(roles):
+        order = ["gpu", "gpu_root_port", "audio", "storage", "nic", "pcie_root_port"]
+        labels = {
+            "gpu": "GPU",
+            "gpu_root_port": "GPU-ROOT",
+            "audio": "AUDIO",
+            "storage": "STORAGE",
+            "nic": "NIC",
+            "pcie_root_port": "ROOT",
+        }
+        selected = [labels[x] for x in order if x in roles]
+        return "|".join(selected)
+
+    def build_target_strategy_text(self):
+        role_groups = {"gpu": [], "gpu_root_port": [], "audio": [], "storage": [], "nic": []}
+        for entry in self.device_entries:
+            iid = self._normalize_instance_id(entry["instance"])
+            roles = self.device_roles.get(iid, set())
+            for role in role_groups:
+                if role in roles:
+                    role_groups[role].append(entry["name"])
+
+        base = self.get_recommended_cores()
+        gpu_group = base[: min(4, len(base))]
+        if not gpu_group:
+            gpu_group = [0]
+
+        adjacent_core = None
+        if self.logical_processors > 1:
+            candidate = gpu_group[-1] + 1
+            adjacent_core = candidate if candidate < self.logical_processors else max(0, gpu_group[0] - 1)
+
+        side_group = [x for x in base if x not in gpu_group][:2]
+        if not side_group:
+            side_group = [adjacent_core] if adjacent_core is not None else [gpu_group[0]]
+
+        lines = [
+            "Target device recommendation (priority): GPU → GPU Root Port → Audio → Storage → NIC",
+            f"Detected GPU: {len(role_groups['gpu'])}, GPU Root Port: {len(role_groups['gpu_root_port'])}, "
+            f"Audio: {len(role_groups['audio'])}, Storage: {len(role_groups['storage'])}, NIC: {len(role_groups['nic'])}",
+            "",
+            "Core placement policy:",
+            f"- GPU: use primary nearby physical-core group {gpu_group}",
+            "- GPU Root Port: prefer adjacent core(s) in same locality (not forced to exact same single core)",
+            f"  Suggested adjacent core: {adjacent_core if adjacent_core is not None else gpu_group[0]}",
+            f"- Audio/Storage/NIC: place on nearby but separate side cores when possible {side_group}",
+            "",
+            "Reasoning: forcing GPU and PCIe Root Port onto one identical core can increase IRQ contention.",
+            "Using adjacent physical cores in the same locality usually balances cache/topology proximity and contention.",
+        ]
+        return "\n".join(lines)
+
+    def update_recommendation_text(self):
+        self.recommend_text.configure(state="normal")
+        self.recommend_text.delete("1.0", tk.END)
+        self.recommend_text.insert("1.0", self.build_target_strategy_text())
+        self.recommend_text.configure(state="disabled")
+
+    def select_target_devices(self):
+        self.tree.selection_remove(*self.tree.selection())
+        selected_ids = []
+        for instance_id, item_id in self.tree_item_by_instance.items():
+            roles = self.device_roles.get(self._normalize_instance_id(instance_id), set())
+            if roles & {"gpu", "gpu_root_port", "audio", "storage", "nic"}:
+                selected_ids.append(item_id)
+        for item_id in selected_ids:
+            self.tree.selection_add(item_id)
+        if selected_ids:
+            self.tree.focus(selected_ids[0])
+            self.tree.see(selected_ids[0])
+            self.on_device_select()
+        self.status_var.set(f"Selected {len(selected_ids)} recommended target devices")
+
     def create_widgets(self):
         top_frame = tk.Frame(self.root)
         top_frame.pack(fill=tk.X, padx=14, pady=(10, 6))
@@ -289,6 +424,7 @@ class IRQOptimizerApp:
         controls = tk.Frame(self.root)
         controls.pack(fill=tk.X, padx=14, pady=8)
         tk.Button(controls, text="Refresh Devices", command=self.load_devices, width=18).pack(side=tk.LEFT, padx=4)
+        tk.Button(controls, text="Select Target Devices", command=self.select_target_devices, width=20).pack(side=tk.LEFT, padx=4)
         tk.Button(controls, text="Use Recommended", command=self.select_recommended_cores, width=18).pack(side=tk.LEFT, padx=4)
         tk.Button(controls, text="Apply", command=self.apply_affinity, width=12, bg="#16a34a", fg="white").pack(side=tk.LEFT, padx=4)
         tk.Button(controls, text="Factory Reset", command=self.factory_reset, width=14, bg="#dc2626", fg="white").pack(side=tk.LEFT, padx=4)
@@ -300,6 +436,13 @@ class IRQOptimizerApp:
         self.cpu_text.pack(fill=tk.X, padx=6, pady=6)
         self.cpu_text.insert("1.0", self.analyze_cpu_topology())
         self.cpu_text.configure(state="disabled")
+
+        recommend_box = tk.LabelFrame(self.root, text="Target Recommendation")
+        recommend_box.pack(fill=tk.X, padx=14, pady=6)
+        self.recommend_text = tk.Text(recommend_box, height=9, wrap="word", font=("Consolas", 10))
+        self.recommend_text.pack(fill=tk.X, padx=6, pady=6)
+        self.recommend_text.insert("1.0", "Recommendation will be generated after device scan.")
+        self.recommend_text.configure(state="disabled")
 
         core_box = tk.LabelFrame(self.root, text="Core Selection (group 0)")
         core_box.pack(fill=tk.BOTH, expand=True, padx=14, pady=6)
@@ -348,15 +491,27 @@ class IRQOptimizerApp:
 
     def _device_query_script(self):
         return r"""
-Get-CimInstance Win32_PnPEntity |
-Where-Object { $_.PNPDeviceID -and $_.Name } |
-Sort-Object Name |
-Select-Object Name, PNPClass, PNPDeviceID |
-ConvertTo-Json -Depth 2
+$devices = Get-CimInstance Win32_PnPEntity | Where-Object { $_.PNPDeviceID -and $_.Name }
+$output = foreach ($dev in $devices) {
+  $parent = $null
+  try {
+    $parent = (Get-PnpDeviceProperty -InstanceId $dev.PNPDeviceID -KeyName 'DEVPKEY_Device_Parent' -ErrorAction Stop).Data
+  } catch {}
+  [PSCustomObject]@{
+    Name = $dev.Name
+    PNPClass = $dev.PNPClass
+    PNPDeviceID = $dev.PNPDeviceID
+    ParentInstanceId = $parent
+  }
+}
+$output | Sort-Object Name | ConvertTo-Json -Depth 3
 """.strip()
 
     def load_devices(self):
         self.tree.delete(*self.tree.get_children())
+        self.device_entries = []
+        self.device_roles = {}
+        self.tree_item_by_instance = {}
         try:
             result = self._run_powershell(self._device_query_script())
             if result.returncode != 0:
@@ -372,9 +527,23 @@ ConvertTo-Json -Depth 2
                 name = item.get("Name") or "(Unnamed Device)"
                 cls = item.get("PNPClass") or "Unknown"
                 instance = item.get("PNPDeviceID")
+                parent = item.get("ParentInstanceId")
                 if not instance:
                     continue
-                self.tree.insert("", "end", values=(name, cls, instance))
+                self.device_entries.append(
+                    {"name": name, "class": cls, "instance": instance, "parent": parent}
+                )
+
+            self.device_roles = self.build_device_role_map(self.device_entries)
+            for entry in self.device_entries:
+                instance = entry["instance"]
+                roles = self.device_roles.get(self._normalize_instance_id(instance), set())
+                label = self.role_label(roles)
+                disp_name = f"[{label}] {entry['name']}" if label else entry["name"]
+                item_id = self.tree.insert("", "end", values=(disp_name, entry["class"], instance))
+                self.tree_item_by_instance[instance] = item_id
+
+            self.update_recommendation_text()
 
             self.status_var.set(f"Loaded {len(self.tree.get_children())} devices")
         except Exception as exc:
