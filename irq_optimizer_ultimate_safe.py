@@ -209,20 +209,10 @@ class IRQOptimizerApp:
     @staticmethod
     def build_preference_profiles():
         return {
-            "Balanced": {
-                "role_order": ["gpu", "audio", "nic"],
-                "target_roles": {"gpu", "audio", "nic"},
-                "description": "GPU·오디오·네트워크 장치를 중심으로 한 기본 게임 환경 권장값입니다.",
-            },
             "Low Latency": {
-                "role_order": ["gpu", "nic", "audio"],
-                "target_roles": {"gpu", "audio", "nic"},
-                "description": "입력/네트워크 반응성을 우선해 GPU·NIC·오디오만 집중 배치합니다.",
-            },
-            "Streaming": {
-                "role_order": ["gpu", "audio", "nic"],
-                "target_roles": {"gpu", "audio", "nic"},
-                "description": "방송/녹화 중 안정성을 위해 GPU·오디오·네트워크 장치 균형을 우선합니다.",
+                "role_order": ["gpu", "gpu_root_port", "nic", "audio"],
+                "target_roles": {"gpu", "gpu_root_port", "audio", "nic"},
+                "description": "입력/네트워크 반응성을 우선해 GPU·GPU 루트 포트·NIC·오디오를 집중 배치합니다.",
             },
         }
 
@@ -231,10 +221,10 @@ class IRQOptimizerApp:
             selected = self.preference_profile_var.get()
             if selected in self.preference_profiles:
                 return selected
-        return "Balanced"
+        return "Low Latency"
 
     def get_active_profile(self):
-        return self.preference_profiles.get(self.get_active_profile_name(), self.preference_profiles["Balanced"])
+        return self.preference_profiles.get(self.get_active_profile_name(), self.preference_profiles["Low Latency"])
 
     def get_active_role_order(self):
         return list(self.get_active_profile().get("role_order", []))
@@ -867,6 +857,7 @@ class IRQOptimizerApp:
             f"프로필 설명: {profile.get('description', '')}",
             f"대상 우선순위: {priority_text}",
             f"감지된 장치 수: {summary}",
+            "GPU-ROOT 감지: GPU 장치의 부모 체인을 추적해 연결된 PCIe Root Port를 자동 식별",
             f"토폴로지 요약: 소스 {topo.get('topology_source', '휴리스틱 추정')}, "
             f"그룹 {topo.get('summary', {}).get('group_count', 1)}, "
             f"NUMA 노드 {topo.get('numa_node_count', 1)}, "
@@ -984,11 +975,9 @@ class IRQOptimizerApp:
             self.sidebar, text="Target Profile", font=_FONT_SECTION,
         ).pack(anchor="w", padx=10, pady=(14, 4))
 
-        self.preference_profile_var = tk.StringVar(value="Balanced")
+        self.preference_profile_var = tk.StringVar(value="Low Latency")
         _profile_info = {
-            "Balanced":    "게임·작업 혼용 환경 추천",
-            "Low Latency": "경쟁 게임 / 낮은 입력 지연 우선",
-            "Streaming":   "방송·녹화 병행 환경 추천",
+            "Low Latency": "경쟁 게임 / 낮은 입력 지연 우선 (GPU-ROOT 자동 포함)",
         }
         for name, desc in _profile_info.items():
             card = ctk.CTkFrame(self.sidebar, corner_radius=8)
