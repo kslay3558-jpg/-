@@ -10,6 +10,8 @@ from datetime import datetime
 import tkinter as tk
 from tkinter import messagebox, ttk
 
+import customtkinter as ctk
+
 try:
     import winreg
 except ImportError as exc:  # pragma: no cover - runtime guard for non-Windows hosts
@@ -18,6 +20,40 @@ except ImportError as exc:  # pragma: no cover - runtime guard for non-Windows h
 
 APP_VERSION = "1.0.0"
 BACKUP_SCHEMA_VERSION = 1
+
+# ── Color palette ──────────────────────────────────────────────────────────────
+_TILE_NORMAL   = ("gray80", "gray25")
+_TILE_SELECTED = ("#16a34a", "#22c55e")
+_TILE_HOVER    = ("gray72", "gray32")
+_RECOMMEND_BORDER = ("#ca8a04", "#fbbf24")
+
+_TREE_TAG_COLORS = {
+    "dark": {
+        "tag_gpu":     "#a78bfa",
+        "tag_root":    "#f472b6",
+        "tag_audio":   "#60a5fa",
+        "tag_storage": "#fb923c",
+        "tag_nic":     "#4ade80",
+        "tag_usb":     "#94a3b8",
+    },
+    "light": {
+        "tag_gpu":     "#7c3aed",
+        "tag_root":    "#be185d",
+        "tag_audio":   "#1d4ed8",
+        "tag_storage": "#c2410c",
+        "tag_nic":     "#15803d",
+        "tag_usb":     "#475569",
+    },
+}
+
+_ROLE_TAG = {
+    "gpu":            "tag_gpu",
+    "gpu_root_port":  "tag_root",
+    "audio":          "tag_audio",
+    "storage":        "tag_storage",
+    "nic":            "tag_nic",
+    "usb_controller": "tag_usb",
+}
 
 
 def is_admin():
@@ -38,8 +74,10 @@ class IRQOptimizerApp:
     def __init__(self, root):
         self.root = root
         self.root.title("IRQ Optimizer (Ultimate Safe Edition)")
-        self.root.geometry("920x860")
-        self.root.resizable(False, False)
+
+        self._theme_mode = "dark"
+        self._core_tiles: list[ctk.CTkButton] = []
+        self._topo_expanded = False
 
         self.core_vars = []
         self.checkbuttons = []
@@ -635,115 +673,376 @@ $numa = Get-CimInstance Win32_NumaNode | Select-Object NodeNumber,NumberOfLogica
             f"Selected {len(selected_ids)} recommended target devices ({self.get_active_profile_name()})"
         )
 
+    # ── Widget construction ────────────────────────────────────────────────────
+
     def create_widgets(self):
-        top_frame = tk.Frame(self.root)
-        top_frame.pack(fill=tk.X, padx=14, pady=(10, 6))
+        self.root.geometry("1260x900")
+        self.root.minsize(1000, 720)
+        self.root.resizable(True, True)
 
-        info = tk.Label(
-            top_frame,
-            text="Select a device, choose CPU cores, then Apply IRQ Affinity.",
-            fg="#1d4ed8",
-            font=("Segoe UI", 10, "bold"),
+        # ── Header bar ────────────────────────────────────────────────────────
+        self.header = ctk.CTkFrame(self.root, height=52, corner_radius=0, fg_color="#0f172a")
+        self.header.pack(fill=tk.X, side=tk.TOP)
+        self.header.pack_propagate(False)
+
+        ctk.CTkLabel(
+            self.header,
+            text=f"  🔧  IRQ Optimizer  —  Ultimate Safe Edition   v{APP_VERSION}",
+            font=ctk.CTkFont("Segoe UI", 15, "bold"),
+            text_color="#f1f5f9",
+        ).pack(side=tk.LEFT, padx=14, pady=10)
+
+        self.theme_btn = ctk.CTkButton(
+            self.header,
+            text="☀️  Light",
+            width=96,
+            height=32,
+            command=self._toggle_theme,
+            fg_color="#1e293b",
+            hover_color="#334155",
+            text_color="#f1f5f9",
+            corner_radius=8,
         )
-        info.pack(anchor="w")
+        self.theme_btn.pack(side=tk.RIGHT, padx=14, pady=10)
 
-        columns = ("Name", "Class", "InstanceID")
-        self.tree = ttk.Treeview(self.root, columns=columns, show="headings", height=10)
-        self.tree.heading("Name", text="Device")
-        self.tree.heading("Class", text="Class")
-        self.tree.heading("InstanceID", text="InstanceID")
-        self.tree.column("Name", width=600)
-        self.tree.column("Class", width=140)
-        self.tree.column("InstanceID", width=0, stretch=False)
-        self.tree.pack(fill=tk.X, padx=14)
-        self.tree.bind("<<TreeviewSelect>>", self.on_device_select)
+        # ── Body (sidebar | main) ─────────────────────────────────────────────
+        self.body = ctk.CTkFrame(self.root, corner_radius=0, fg_color="transparent")
+        self.body.pack(fill=tk.BOTH, expand=True, side=tk.TOP)
+        self.body.columnconfigure(1, weight=1)
+        self.body.rowconfigure(0, weight=1)
 
-        controls = tk.Frame(self.root)
-        controls.pack(fill=tk.X, padx=14, pady=8)
-        tk.Button(controls, text="Refresh Devices", command=self.load_devices, width=18).pack(side=tk.LEFT, padx=4)
-        tk.Button(controls, text="Select Target Devices", command=self.select_target_devices, width=20).pack(side=tk.LEFT, padx=4)
-        tk.Button(controls, text="Use Recommended", command=self.select_recommended_cores, width=18).pack(side=tk.LEFT, padx=4)
-        tk.Button(controls, text="Apply", command=self.apply_affinity, width=12, bg="#16a34a", fg="white").pack(side=tk.LEFT, padx=4)
-        tk.Button(controls, text="Factory Reset", command=self.factory_reset, width=14, bg="#dc2626", fg="white").pack(side=tk.LEFT, padx=4)
-        tk.Button(controls, text="Undo Last", command=self.undo_last_change, width=12).pack(side=tk.LEFT, padx=4)
+        # Sidebar
+        self.sidebar = ctk.CTkScrollableFrame(self.body, width=280, corner_radius=0)
+        self.sidebar.grid(row=0, column=0, sticky="nsew")
+        self._build_sidebar()
 
-        pref_box = tk.LabelFrame(self.root, text="Target Preference Profile")
-        pref_box.pack(fill=tk.X, padx=14, pady=(0, 6))
+        # Main panel
+        self.main_panel = ctk.CTkFrame(self.body, corner_radius=0, fg_color="transparent")
+        self.main_panel.grid(row=0, column=1, sticky="nsew")
+        self.main_panel.columnconfigure(0, weight=1)
+        self.main_panel.rowconfigure(0, weight=2)   # device list
+        self.main_panel.rowconfigure(1, weight=3)   # core grid
+        self.main_panel.rowconfigure(2, weight=0)   # toolbar (fixed)
+        self._build_device_list()
+        self._build_core_grid()
+        self._build_toolbar()
+
+        # ── Status bar ────────────────────────────────────────────────────────
+        self._build_status_bar()
+
+        self.build_core_selector()
+        self._apply_treeview_style()
+
+    # ── Sidebar ────────────────────────────────────────────────────────────────
+
+    def _build_sidebar(self):
+        _FONT_SECTION = ctk.CTkFont("Segoe UI", 12, "bold")
+        _FONT_DESC    = ctk.CTkFont("Segoe UI", 10)
+
+        # ── Target Profile radio cards ─────────────────────────────────────
+        ctk.CTkLabel(
+            self.sidebar, text="Target Profile", font=_FONT_SECTION,
+        ).pack(anchor="w", padx=10, pady=(14, 4))
+
         self.preference_profile_var = tk.StringVar(value="Balanced")
-        tk.Label(pref_box, text="Mode").pack(side=tk.LEFT, padx=(8, 4), pady=6)
-        profile_combo = ttk.Combobox(
-            pref_box,
-            textvariable=self.preference_profile_var,
-            values=list(self.preference_profiles.keys()),
-            state="readonly",
-            width=18,
+        _profile_info = {
+            "Balanced":    "게임·작업 혼용 환경 추천",
+            "Low Latency": "경쟁 게임 / 낮은 입력 지연 우선",
+            "Streaming":   "방송·녹화 병행 환경 추천",
+        }
+        for name, desc in _profile_info.items():
+            card = ctk.CTkFrame(self.sidebar, corner_radius=8)
+            card.pack(fill=tk.X, padx=8, pady=3)
+            ctk.CTkRadioButton(
+                card,
+                text=name,
+                variable=self.preference_profile_var,
+                value=name,
+                command=self.on_profile_change,
+                font=_FONT_SECTION,
+            ).pack(anchor="w", padx=10, pady=(8, 2))
+            ctk.CTkLabel(
+                card, text=desc, font=_FONT_DESC, text_color=("gray40", "gray65"),
+            ).pack(anchor="w", padx=28, pady=(0, 8))
+
+        # ── CPU Topology accordion ─────────────────────────────────────────
+        ctk.CTkFrame(self.sidebar, height=1, fg_color=("gray80", "gray30")).pack(
+            fill=tk.X, padx=8, pady=(16, 0)
         )
-        profile_combo.pack(side=tk.LEFT, padx=4, pady=6)
-        profile_combo.bind("<<ComboboxSelected>>", self.on_profile_change)
-        tk.Label(
-            pref_box,
-            text="Switch profile, then click 'Select Target Devices' to apply role preference.",
-            fg="#334155",
-        ).pack(side=tk.LEFT, padx=8)
+        self.topo_toggle_btn = ctk.CTkButton(
+            self.sidebar,
+            text="▶  CPU Topology",
+            anchor="w",
+            command=self._toggle_topology,
+            fg_color="transparent",
+            hover_color=("gray85", "gray25"),
+            text_color=("gray10", "gray90"),
+            font=_FONT_SECTION,
+            height=34,
+        )
+        self.topo_toggle_btn.pack(fill=tk.X, padx=8, pady=(4, 0))
 
-        cpu_box = tk.LabelFrame(self.root, text="CPU Topology")
-        cpu_box.pack(fill=tk.X, padx=14, pady=6)
-        self.cpu_text = tk.Text(cpu_box, height=6, wrap="word", font=("Consolas", 10))
-        self.cpu_text.pack(fill=tk.X, padx=6, pady=6)
-        self.cpu_text.insert("1.0", self.analyze_cpu_topology())
-        self.cpu_text.configure(state="disabled")
+        self.topo_textbox = ctk.CTkTextbox(
+            self.sidebar, height=160, font=ctk.CTkFont("Consolas", 10), wrap="word"
+        )
+        self.topo_textbox.insert("1.0", self.analyze_cpu_topology())
+        self.topo_textbox.configure(state="disabled")
+        # Not packed yet — revealed on toggle
 
-        recommend_box = tk.LabelFrame(self.root, text="Target Recommendation")
-        recommend_box.pack(fill=tk.X, padx=14, pady=6)
-        self.recommend_text = tk.Text(recommend_box, height=9, wrap="word", font=("Consolas", 10))
-        self.recommend_text.pack(fill=tk.X, padx=6, pady=6)
+        # ── Recommendation text ────────────────────────────────────────────
+        ctk.CTkFrame(self.sidebar, height=1, fg_color=("gray80", "gray30")).pack(
+            fill=tk.X, padx=8, pady=(12, 0)
+        )
+        ctk.CTkLabel(
+            self.sidebar, text="Target Recommendation", font=_FONT_SECTION,
+        ).pack(anchor="w", padx=10, pady=(8, 4))
+
+        self.recommend_text = ctk.CTkTextbox(
+            self.sidebar, height=240, font=ctk.CTkFont("Consolas", 10), wrap="word"
+        )
+        self.recommend_text.pack(fill=tk.X, padx=8, pady=(0, 14))
         self.recommend_text.insert("1.0", "Recommendation will be generated after device scan.")
         self.recommend_text.configure(state="disabled")
 
-        core_box = tk.LabelFrame(self.root, text="Core Selection (group 0)")
-        core_box.pack(fill=tk.BOTH, expand=True, padx=14, pady=6)
-        self.core_canvas = tk.Canvas(core_box, height=300)
-        self.core_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        scrollbar = ttk.Scrollbar(core_box, orient="vertical", command=self.core_canvas.yview)
-        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
-        self.core_canvas.configure(yscrollcommand=scrollbar.set)
+    def _toggle_topology(self):
+        if self._topo_expanded:
+            self.topo_textbox.pack_forget()
+            self.topo_toggle_btn.configure(text="▶  CPU Topology")
+            self._topo_expanded = False
+        else:
+            self.topo_textbox.pack(fill=tk.X, padx=8, pady=(0, 4))
+            self.topo_toggle_btn.configure(text="▼  CPU Topology")
+            self._topo_expanded = True
 
-        self.core_frame = tk.Frame(self.core_canvas)
-        self.core_canvas.create_window((0, 0), window=self.core_frame, anchor="nw")
-        self.core_frame.bind(
-            "<Configure>",
-            lambda e: self.core_canvas.configure(scrollregion=self.core_canvas.bbox("all")),
-        )
+    # ── Device list ────────────────────────────────────────────────────────────
+
+    def _build_device_list(self):
+        device_frame = ctk.CTkFrame(self.main_panel, corner_radius=8)
+        device_frame.grid(row=0, column=0, sticky="nsew", padx=(6, 10), pady=(10, 4))
+        device_frame.rowconfigure(1, weight=1)
+        device_frame.columnconfigure(0, weight=1)
+
+        ctk.CTkLabel(
+            device_frame,
+            text="Device List",
+            font=ctk.CTkFont("Segoe UI", 12, "bold"),
+        ).grid(row=0, column=0, sticky="w", padx=10, pady=(8, 4))
+
+        tree_wrap = tk.Frame(device_frame, bg=device_frame.cget("fg_color")[1]
+                             if isinstance(device_frame.cget("fg_color"), (list, tuple))
+                             else device_frame.cget("fg_color"))
+        tree_wrap.grid(row=1, column=0, sticky="nsew", padx=6, pady=(0, 6))
+        tree_wrap.columnconfigure(0, weight=1)
+        tree_wrap.rowconfigure(0, weight=1)
+
+        columns = ("Name", "Class", "InstanceID")
+        self.tree = ttk.Treeview(tree_wrap, columns=columns, show="headings", height=12)
+        self.tree.heading("Name", text="Device")
+        self.tree.heading("Class", text="Class")
+        self.tree.heading("InstanceID", text="InstanceID")
+        self.tree.column("Name", width=580)
+        self.tree.column("Class", width=130)
+        self.tree.column("InstanceID", width=0, stretch=False)
+        self.tree.grid(row=0, column=0, sticky="nsew")
+        self.tree.bind("<<TreeviewSelect>>", self.on_device_select)
+
+        vsb = ttk.Scrollbar(tree_wrap, orient="vertical", command=self.tree.yview)
+        vsb.grid(row=0, column=1, sticky="ns")
+        self.tree.configure(yscrollcommand=vsb.set)
+
+    # ── Core tile grid ─────────────────────────────────────────────────────────
+
+    def _build_core_grid(self):
+        core_outer = ctk.CTkFrame(self.main_panel, corner_radius=8)
+        core_outer.grid(row=1, column=0, sticky="nsew", padx=(6, 10), pady=4)
+        core_outer.rowconfigure(1, weight=1)
+        core_outer.columnconfigure(0, weight=1)
+
+        ctk.CTkLabel(
+            core_outer,
+            text="Core Selection  (Processor Group 0)",
+            font=ctk.CTkFont("Segoe UI", 12, "bold"),
+        ).grid(row=0, column=0, sticky="w", padx=10, pady=(8, 4))
+
+        self.core_scroll = ctk.CTkScrollableFrame(core_outer, corner_radius=0)
+        self.core_scroll.grid(row=1, column=0, sticky="nsew", padx=6, pady=(0, 6))
+        self.core_tile_frame = self.core_scroll
+
+    # ── Button toolbar ─────────────────────────────────────────────────────────
+
+    def _build_toolbar(self):
+        toolbar = ctk.CTkFrame(self.main_panel, height=58, corner_radius=8)
+        toolbar.grid(row=2, column=0, sticky="ew", padx=(6, 10), pady=(4, 10))
+        toolbar.pack_propagate(False)
+
+        _BTN = dict(height=36, corner_radius=6, font=ctk.CTkFont("Segoe UI", 12))
+
+        left = ctk.CTkFrame(toolbar, fg_color="transparent")
+        left.pack(side=tk.LEFT, fill=tk.Y, padx=8)
+        ctk.CTkButton(left, text="🔄  Refresh",        command=self.load_devices,           width=118, **_BTN).pack(side=tk.LEFT, padx=3, pady=11)
+        ctk.CTkButton(left, text="🎯  Select Targets", command=self.select_target_devices,  width=134, **_BTN).pack(side=tk.LEFT, padx=3, pady=11)
+        ctk.CTkButton(left, text="⭐  Use Recommended", command=self.select_recommended_cores, width=148, **_BTN).pack(side=tk.LEFT, padx=3, pady=11)
+
+        right = ctk.CTkFrame(toolbar, fg_color="transparent")
+        right.pack(side=tk.RIGHT, fill=tk.Y, padx=8)
+        ctk.CTkButton(
+            right, text="↩  Undo Last",     command=self.undo_last_change,
+            width=118, fg_color=("#64748b", "#475569"), hover_color=("#475569", "#334155"), **_BTN,
+        ).pack(side=tk.LEFT, padx=3, pady=11)
+        ctk.CTkButton(
+            right, text="🗑  Factory Reset", command=self.factory_reset,
+            width=130, fg_color=("#dc2626", "#ef4444"), hover_color=("#b91c1c", "#dc2626"), **_BTN,
+        ).pack(side=tk.LEFT, padx=3, pady=11)
+        ctk.CTkButton(
+            right, text="✅  Apply",         command=self.apply_affinity,
+            width=110, fg_color=("#16a34a", "#22c55e"), hover_color=("#15803d", "#16a34a"),
+            font=ctk.CTkFont("Segoe UI", 13, "bold"), height=36, corner_radius=6,
+        ).pack(side=tk.LEFT, padx=3, pady=11)
+
+    # ── Status bar ─────────────────────────────────────────────────────────────
+
+    def _build_status_bar(self):
+        self.status_bar = ctk.CTkFrame(self.root, height=36, corner_radius=0)
+        self.status_bar.pack(fill=tk.X, side=tk.BOTTOM)
+        self.status_bar.pack_propagate(False)
 
         self.status_var = tk.StringVar(value="Ready")
-        tk.Label(self.root, textvariable=self.status_var, anchor="w").pack(fill=tk.X, padx=14, pady=(2, 8))
+        self.status_label = ctk.CTkLabel(
+            self.status_bar,
+            text="Ready",
+            font=ctk.CTkFont("Segoe UI", 11),
+            anchor="w",
+        )
+        self.status_label.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=12)
+        self.status_var.trace_add(
+            "write",
+            lambda *_: self.status_label.configure(text=self.status_var.get()),
+        )
 
-        self.build_core_selector()
+        self.progress_bar = ctk.CTkProgressBar(self.status_bar, width=150, mode="indeterminate")
+        self.progress_bar.pack(side=tk.RIGHT, padx=10, pady=7)
+        self.progress_bar.set(0)
+
+    def _start_busy(self):
+        self.progress_bar.configure(mode="indeterminate")
+        self.progress_bar.start()
+
+    def _stop_busy(self):
+        self.progress_bar.stop()
+        self.progress_bar.set(0)
+
+    # ── Theme toggle ───────────────────────────────────────────────────────────
+
+    def _toggle_theme(self):
+        if self._theme_mode == "dark":
+            ctk.set_appearance_mode("light")
+            self._theme_mode = "light"
+            self.theme_btn.configure(text="🌙  Dark")
+        else:
+            ctk.set_appearance_mode("dark")
+            self._theme_mode = "dark"
+            self.theme_btn.configure(text="☀️  Light")
+        self._apply_treeview_style()
+        self.highlight_recommendations()
+
+    def _apply_treeview_style(self):
+        mode = self._theme_mode
+        style = ttk.Style()
+        style.theme_use("clam")
+        if mode == "dark":
+            style.configure("Treeview",
+                background="#1e293b", foreground="#f1f5f9",
+                rowheight=26, fieldbackground="#1e293b",
+                font=("Segoe UI", 10))
+            style.configure("Treeview.Heading",
+                background="#0f172a", foreground="#94a3b8",
+                font=("Segoe UI", 10, "bold"))
+            style.map("Treeview", background=[("selected", "#1d4ed8")])
+        else:
+            style.configure("Treeview",
+                background="#ffffff", foreground="#0f172a",
+                rowheight=26, fieldbackground="#ffffff",
+                font=("Segoe UI", 10))
+            style.configure("Treeview.Heading",
+                background="#f1f5f9", foreground="#475569",
+                font=("Segoe UI", 10, "bold"))
+            style.map("Treeview", background=[("selected", "#bfdbfe")])
+
+        colors = _TREE_TAG_COLORS[mode]
+        for tag, color in colors.items():
+            self.tree.tag_configure(tag, foreground=color)
+
+    @staticmethod
+    def _get_device_tag(roles):
+        """Return the treeview tag for the most significant role."""
+        for role in ("gpu", "gpu_root_port", "audio", "storage", "nic", "usb_controller"):
+            if role in roles:
+                return _ROLE_TAG.get(role)
+        return None
+
+    # ── Core selector (tile-based) ─────────────────────────────────────────────
 
     def build_core_selector(self):
-        for cb in self.checkbuttons:
-            cb.destroy()
+        for tile in self._core_tiles:
+            tile.destroy()
+        self._core_tiles.clear()
         self.core_vars.clear()
         self.checkbuttons.clear()
 
+        # Estimate P/E core boundary for Intel hybrid
+        pe_boundary = None
+        if self.cpu_arch == "intel_hybrid":
+            pe_boundary = max(2, (self.physical_cores * 2) // 3)
+
+        _cols = 8
         for i in range(self.logical_processors):
             var = tk.BooleanVar(value=False)
-            cb = tk.Checkbutton(self.core_frame, text=f"CPU {i}", variable=var)
-            row = i // 8
-            col = i % 8
-            cb.grid(row=row, column=col, padx=8, pady=6, sticky="w")
             self.core_vars.append(var)
-            self.checkbuttons.append(cb)
+
+            if pe_boundary is not None:
+                badge = "P" if i < pe_boundary else "E"
+                label = f"CPU {i}\n[{badge}]"
+            else:
+                label = f"CPU {i}"
+
+            btn = ctk.CTkButton(
+                self.core_tile_frame,
+                text=label,
+                width=72,
+                height=52,
+                corner_radius=6,
+                border_width=2,
+                border_color="transparent",
+                fg_color=_TILE_NORMAL,
+                hover_color=_TILE_HOVER,
+                command=lambda idx=i: self._toggle_core(idx),
+                font=ctk.CTkFont("Segoe UI", 10),
+            )
+            btn.grid(row=i // _cols, column=i % _cols, padx=4, pady=4)
+            self._core_tiles.append(btn)
+            self.checkbuttons.append(btn)
 
         self.recommended_cores = self.get_recommended_cores()
         self.highlight_recommendations()
 
+    def _toggle_core(self, idx: int):
+        self.core_vars[idx].set(not self.core_vars[idx].get())
+        self._refresh_tile(idx)
+
+    def _refresh_tile(self, idx: int):
+        btn = self._core_tiles[idx]
+        selected      = self.core_vars[idx].get()
+        is_recommended = idx in self.recommended_cores
+
+        btn.configure(fg_color=_TILE_SELECTED if selected else _TILE_NORMAL)
+        if is_recommended:
+            btn.configure(border_color=_RECOMMEND_BORDER, border_width=2)
+        else:
+            btn.configure(border_color="transparent", border_width=2)
+
     def highlight_recommendations(self):
-        for i, cb in enumerate(self.checkbuttons):
-            if i in self.recommended_cores:
-                cb.configure(bg="#fef08a")
-            else:
-                cb.configure(bg=self.root.cget("bg"))
+        for i in range(len(self._core_tiles)):
+            self._refresh_tile(i)
 
     def _device_query_script(self):
         return r"""
@@ -764,6 +1063,7 @@ $output | Sort-Object Name | ConvertTo-Json -Depth 3
 """.strip()
 
     def load_devices(self):
+        self._start_busy()
         self.tree.delete(*self.tree.get_children())
         self.device_entries = []
         self.device_roles = {}
@@ -796,7 +1096,12 @@ $output | Sort-Object Name | ConvertTo-Json -Depth 3
                 roles = self.device_roles.get(self._normalize_instance_id(instance), set())
                 label = self.role_label(roles)
                 disp_name = f"[{label}] {entry['name']}" if label else entry["name"]
-                item_id = self.tree.insert("", "end", values=(disp_name, entry["class"], instance))
+                tag = self._get_device_tag(roles)
+                item_id = self.tree.insert(
+                    "", "end",
+                    values=(disp_name, entry["class"], instance),
+                    tags=(tag,) if tag else (),
+                )
                 self.tree_item_by_instance[instance] = item_id
 
             self.update_recommendation_text()
@@ -805,6 +1110,8 @@ $output | Sort-Object Name | ConvertTo-Json -Depth 3
         except Exception as exc:
             self.status_var.set("Failed to load devices")
             messagebox.showerror("Device load failed", str(exc))
+        finally:
+            self._stop_busy()
 
     def on_device_select(self, _event=None):
         selected = self.tree.selection()
@@ -831,6 +1138,10 @@ $output | Sort-Object Name | ConvertTo-Json -Depth 3
         mask = int.from_bytes(assignment, byteorder="little", signed=False)
         for i, var in enumerate(self.core_vars):
             var.set(bool(mask & (1 << i)))
+
+        for i in range(len(self._core_tiles)):
+            self._refresh_tile(i)
+
         self.status_var.set(f"Device selected (current mask: {hex(mask)})")
 
     def get_selected_cores(self):
@@ -854,6 +1165,7 @@ $output | Sort-Object Name | ConvertTo-Json -Depth 3
             messagebox.showwarning("No device", "Select a device first.")
             return
 
+        self._start_busy()
         try:
             cores = self.get_selected_cores()
             mask_int = self.mask_from_cores(cores)
@@ -883,6 +1195,8 @@ $output | Sort-Object Name | ConvertTo-Json -Depth 3
             )
         except Exception as exc:
             messagebox.showerror("Apply failed", str(exc))
+        finally:
+            self._stop_busy()
 
     def factory_reset(self):
         if not self.current_instance_id:
@@ -895,6 +1209,7 @@ $output | Sort-Object Name | ConvertTo-Json -Depth 3
         ):
             return
 
+        self._start_busy()
         try:
             current_state = self.read_affinity_values(self.current_instance_id)
             self.backup_current_state(self.current_instance_id, current_state, None, None)
@@ -921,6 +1236,8 @@ $output | Sort-Object Name | ConvertTo-Json -Depth 3
             )
         except Exception as exc:
             messagebox.showerror("Factory reset failed", str(exc))
+        finally:
+            self._stop_busy()
 
     def undo_last_change(self):
         if not self.current_instance_id:
@@ -933,6 +1250,7 @@ $output | Sort-Object Name | ConvertTo-Json -Depth 3
             messagebox.showwarning("Undo unavailable", "No backup found for selected device.")
             return
 
+        self._start_busy()
         try:
             had_affinity_key = bool(entry.get("had_affinity_key", False))
             had_device_policy_key = bool(entry.get("had_device_policy_key", False))
@@ -982,10 +1300,14 @@ $output | Sort-Object Name | ConvertTo-Json -Depth 3
             )
         except Exception as exc:
             messagebox.showerror("Undo failed", str(exc))
+        finally:
+            self._stop_busy()
 
     def select_recommended_cores(self):
         for i, var in enumerate(self.core_vars):
             var.set(i in self.recommended_cores)
+        for i in range(len(self._core_tiles)):
+            self._refresh_tile(i)
         self.status_var.set("Recommended cores selected")
 
 
@@ -994,7 +1316,9 @@ def main():
         relaunch_as_admin()
         sys.exit(0)
 
-    root = tk.Tk()
+    ctk.set_appearance_mode("dark")
+    ctk.set_default_color_theme("blue")
+    root = ctk.CTk()
     app = IRQOptimizerApp(root)
     root.mainloop()
 
