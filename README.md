@@ -93,11 +93,9 @@ dist\IRQOptimizer.exe
 
 ### 2단계 — 대상 장치 선택
 
-- **자동 선택(권장):** `Target Preference Profile` 드롭다운에서 용도에 맞는 프로필을 고른 뒤 **Select Target Devices**를 클릭합니다.
-  - `Balanced` : 게임·작업 혼용 환경
-  - `Low Latency` : 경쟁 게임 등 낮은 지연 우선
-  - `Streaming` : 방송/녹화 병행 환경
-- **기본 가이드 대상:** 코어 할당은 **그래픽 카드(GPU), 오디오 장치(AUDIO), 랜카드(NIC)** 중심으로 진행하세요.
+- **자동 선택(권장):** `Target Profile`은 `Low Latency` 단일 프로필로 고정되며, **Select Target Devices**를 클릭하면 저지연 대상이 자동 선택됩니다.
+- **기본 가이드 대상:** 코어 할당은 **그래픽 카드(GPU), GPU에 연결된 PCIe 루트 포트(GPU-ROOT), 오디오 장치(AUDIO), 랜카드(NIC)** 중심으로 진행하세요.
+- **GPU-ROOT 자동 감지:** 장치 트리에서 GPU의 부모(Parent InstanceID) 경로를 추적해 연결된 루트 포트를 자동으로 `GPU-ROOT`로 태깅합니다.
 - **수동 선택:** 목록에서 장치를 하나 이상 선택할 수 있으며, **Apply to Selected**는 현재 선택된 모든 장치에 동일한 마스크를 적용합니다.
 
 ### 3단계 — CPU 코어 지정
@@ -141,9 +139,9 @@ C:\ProgramData\IRQOptimizer\irq_backup.json
 
 | 분기 | 해당 CPU | 배치 전략 |
 |---|---|---|
-| `intel_hybrid` | 12세대 이상 Core, Core Ultra | GPU → P-코어 중심 + 전반 코어 과집중 방지(후반 포함), 오디오/NIC → 비중첩 코어 |
+| `intel_hybrid` | 12세대 이상 Core, Core Ultra | GPU/오디오 → 물리 P-코어 우선, NIC/스토리지 → 분리 사이드 코어 우선 |
 | `intel_legacy` | 11세대 이하 Core | GPU → 주 로컬리티 중심 + 후반 코어 우선 편향, 오디오/NIC → 분리 배치 |
-| `amd_dual_x3d` | Ryzen 7950X3D / 9950X3D 등 | GPU → CCD0 중심 + 후반 코어 포함, 오디오/NIC → CCD1 우선 |
+| `amd_dual_x3d` | Ryzen 7950X3D / 9950X3D 등 | GPU/오디오 → CCD0 우선, NIC/스토리지 → CCD1 우선 |
 | `amd_single_x3d` | Ryzen 5800X3D / 7800X3D 등 | GPU → X3D 인접 + 후반 코어 편향, 오디오/NIC → 나머지 코어 |
 | `amd_generic` | 그 외 Ryzen / Threadripper | GPU → 주 로컬리티 후반 우선, 오디오/NIC → 분리 배치 |
 
