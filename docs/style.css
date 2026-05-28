@@ -1,0 +1,91 @@
+:root {
+  --bg: #0b1020;
+  --panel: #121a2f;
+  --muted: #9fb0d3;
+  --text: #e8eeff;
+  --accent: #69a7ff;
+  --ok: #62d6a6;
+  --warn: #ffd166;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  font-family: "Segoe UI", "Noto Sans KR", Arial, sans-serif;
+  background: linear-gradient(180deg, #0b1020 0%, #090d18 100%);
+  color: var(--text);
+  line-height: 1.6;
+}
+
+.wrap {
+  width: min(980px, 92%);
+  margin: 32px auto 60px;
+}
+
+.hero,
+.card {
+  background: rgba(18, 26, 47, 0.9);
+  border: 1px solid rgba(105, 167, 255, 0.2);
+  border-radius: 14px;
+  padding: 20px 22px;
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.22);
+}
+
+.hero h1 {
+  margin: 0 0 10px;
+  font-size: 1.7rem;
+}
+
+.hero p {
+  margin: 0;
+  color: var(--muted);
+}
+
+.grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+  gap: 14px;
+  margin-top: 16px;
+}
+
+.card h2 {
+  margin: 0 0 8px;
+  font-size: 1.05rem;
+  color: var(--accent);
+}
+
+ul {
+  margin: 0;
+  padding-left: 18px;
+}
+
+li {
+  margin: 6px 0;
+}
+
+.pill {
+  display: inline-block;
+  padding: 4px 10px;
+  border-radius: 999px;
+  font-size: 0.78rem;
+  margin-right: 6px;
+}
+
+.ok {
+  background: rgba(98, 214, 166, 0.2);
+  color: var(--ok);
+}
+
+.warn {
+  background: rgba(255, 209, 102, 0.2);
+  color: var(--warn);
+}
+
+.footer {
+  margin-top: 16px;
+  color: var(--muted);
+  font-size: 0.93rem;
+}
