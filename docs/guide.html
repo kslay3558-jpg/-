@@ -32,6 +32,7 @@
             <li><b>Refresh Devices</b> 클릭</li>
             <li>역할 태그(GPU/GPU-ROOT/AUDIO/STORAGE/NIC) 확인</li>
             <li><b>Select Target Devices</b>로 권장 대상 자동 선택</li>
+            <li><span class="pill ok">권장</span>코어 할당 대상은 GPU, AUDIO, NIC 3종 위주로 제한</li>
           </ul>
         </article>
 
@@ -73,7 +74,7 @@
               <ul>
                 <li><b>intel_hybrid</b> – P-코어 클러스터에 GPU/Root Port 배치, E-코어에 사이드 장치</li>
                 <li><b>intel_legacy</b> – 균일 물리 코어에 고르게 분산</li>
-                <li><b>amd_dual_x3d</b> – 1차 CCD에 GPU, 2차 CCD에 사이드 장치</li>
+                <li><b>amd_dual_x3d</b> – 1차 CCD 중심이되 전반 코어 과집중을 피하고 후반 코어도 포함</li>
                 <li><b>amd_single_x3d / amd_generic</b> – X3D 캐시 인접성을 유지하며 분산</li>
               </ul>
             </li>

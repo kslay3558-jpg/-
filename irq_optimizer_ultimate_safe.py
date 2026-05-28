@@ -90,6 +90,7 @@ class IRQOptimizerApp:
         self.device_entries = []
         self.device_roles = {}
         self.tree_item_by_instance = {}
+        self._device_sort_desc = False
         self.preference_profiles = self.build_preference_profiles()
         self.powershell_executable = self._resolve_powershell_executable()
 
@@ -209,19 +210,19 @@ class IRQOptimizerApp:
     def build_preference_profiles():
         return {
             "Balanced": {
-                "role_order": ["gpu", "gpu_root_port", "usb_controller", "audio", "storage", "nic"],
-                "target_roles": {"gpu", "gpu_root_port", "usb_controller", "audio", "storage", "nic"},
-                "description": "General gaming balance for latency and stability.",
+                "role_order": ["gpu", "audio", "nic"],
+                "target_roles": {"gpu", "audio", "nic"},
+                "description": "GPU·오디오·네트워크 장치를 중심으로 한 기본 게임 환경 권장값입니다.",
             },
             "Low Latency": {
-                "role_order": ["gpu", "usb_controller", "gpu_root_port", "nic", "audio", "storage"],
-                "target_roles": {"gpu", "gpu_root_port", "usb_controller", "nic", "audio"},
-                "description": "Prioritize input/network responsiveness; storage is lower priority.",
+                "role_order": ["gpu", "nic", "audio"],
+                "target_roles": {"gpu", "audio", "nic"},
+                "description": "입력/네트워크 반응성을 우선해 GPU·NIC·오디오만 집중 배치합니다.",
             },
             "Streaming": {
-                "role_order": ["gpu", "gpu_root_port", "audio", "nic", "usb_controller", "storage"],
-                "target_roles": {"gpu", "gpu_root_port", "audio", "nic", "usb_controller", "storage"},
-                "description": "Prioritize audio/network consistency for stream capture workloads.",
+                "role_order": ["gpu", "audio", "nic"],
+                "target_roles": {"gpu", "audio", "nic"},
+                "description": "방송/녹화 중 안정성을 위해 GPU·오디오·네트워크 장치 균형을 우선합니다.",
             },
         }
 
@@ -407,7 +408,7 @@ class IRQOptimizerApp:
                 "gpu_cores": [0],
                 "gpu_root_cores": [0],
                 "side_cores": [0],
-                "reason": "Single logical processor detected; use CPU 0 for all targets.",
+                "reason": "논리 프로세서가 1개라서 모든 대상에 CPU 0을 사용합니다.",
             }
 
         topo = self.topology_snapshot or {}
@@ -438,7 +439,24 @@ class IRQOptimizerApp:
         gpu_root_cores = []
         side_cores = []
         branch = self.cpu_arch
-        reason = "Fallback conservative placement was applied."
+        reason = "기본 보수 배치 규칙이 적용되었습니다."
+
+        def _tail_biased(values, limit, tail_ratio=0.5):
+            ordered = []
+            for v in values:
+                if isinstance(v, int) and 0 <= v < total and v not in ordered:
+                    ordered.append(v)
+            if not ordered:
+                return []
+            if len(ordered) <= limit:
+                return ordered
+            start = min(len(ordered) - 1, max(0, int(len(ordered) * tail_ratio)))
+            tail = ordered[start:]
+            if len(tail) >= limit:
+                return tail[:limit]
+            need = limit - len(tail)
+            prefix = ordered[max(0, start - need):start]
+            return prefix + tail
 
         if branch == "intel_hybrid":
             eff_map = topo.get("efficiency_class_map_group0", {}) or {}
@@ -452,39 +470,47 @@ class IRQOptimizerApp:
                 e_cores = [x for x in rep_lps if x not in p_cores]
             p_primary = [x for x in primary_locality if x in p_cores]
             e_secondary = [x for x in secondary_locality if x in e_cores]
-            gpu_cores = p_primary[: min(6, len(p_primary))] or p_cores[: min(4, len(p_cores))] or primary_locality[: min(4, len(primary_locality))]
-            gpu_root_cores = p_cores[1:3] or gpu_cores[:1]
-            side_cores = e_secondary[:3] or e_cores[:3] or [x for x in p_cores if x not in gpu_cores][:3]
-            reason = "Intel hybrid branch: efficiency-class-aware placement (P-like class first), while side devices prefer non-overlapping cores."
+            gpu_cores = (
+                _tail_biased(p_primary, min(6, len(p_primary)), tail_ratio=0.5)
+                or _tail_biased(p_cores, min(4, len(p_cores)), tail_ratio=0.5)
+                or _tail_biased(primary_locality, min(4, len(primary_locality)), tail_ratio=0.5)
+            )
+            gpu_root_cores = _tail_biased([x for x in p_cores if x not in gpu_cores], 2, tail_ratio=0.5) or gpu_cores[:1]
+            side_cores = (
+                _tail_biased(e_secondary, 3, tail_ratio=0.5)
+                or _tail_biased(e_cores, 3, tail_ratio=0.5)
+                or _tail_biased([x for x in p_cores if x not in gpu_cores], 3, tail_ratio=0.5)
+            )
+            reason = "Intel 하이브리드 분기: 초반 P코어 과집중을 피하도록 후반 코어를 약하게 우선하는 P코어 인식 배치를 적용했습니다."
         elif branch == "amd_dual_x3d":
             ccd0 = primary_locality or rep_lps[: max(1, len(rep_lps) // 2)]
             ccd1 = secondary_locality or [x for x in rep_lps if x not in ccd0]
-            gpu_cores = ccd0[: min(6, len(ccd0))]
-            gpu_root_cores = ccd0[1:3] or gpu_cores[:1]
-            side_cores = ccd1[:3] or [x for x in ccd0 if x not in gpu_cores][:3]
-            reason = "AMD dual-CCD/X3D branch: NUMA/locality-first spread with conservative fallback heuristics."
+            gpu_cores = _tail_biased(ccd0, min(6, len(ccd0)), tail_ratio=0.5)
+            gpu_root_cores = _tail_biased([x for x in ccd0 if x not in gpu_cores], 2, tail_ratio=0.5) or gpu_cores[:1]
+            side_cores = _tail_biased(ccd1, 3, tail_ratio=0.5) or _tail_biased([x for x in ccd0 if x not in gpu_cores], 3, tail_ratio=0.5)
+            reason = "AMD 듀얼 CCD/X3D 분기: 로컬리티 우선 분할과 GPU 관련 코어의 CCD0 후반 코어 약우선 규칙을 적용했습니다."
         elif branch in {"amd_single_x3d", "amd_generic"}:
             gpu_span = 6 if branch == "amd_single_x3d" else 4
-            gpu_cores = primary_locality[: min(gpu_span, len(primary_locality))]
-            gpu_root_cores = primary_locality[1:3] or gpu_cores[:1]
-            side_cores = [x for x in rep_lps if x not in gpu_cores][:3]
+            gpu_cores = _tail_biased(primary_locality, min(gpu_span, len(primary_locality)), tail_ratio=0.5)
+            gpu_root_cores = _tail_biased([x for x in primary_locality if x not in gpu_cores], 2, tail_ratio=0.5) or gpu_cores[:1]
+            side_cores = _tail_biased([x for x in rep_lps if x not in gpu_cores], 3, tail_ratio=0.5)
             if not side_cores:
-                side_cores = primary_locality[::2][:3]
-            reason = "AMD branch: GPU proximity is maintained while side devices are split to reduce IRQ contention."
+                side_cores = _tail_biased(primary_locality[::2], 3, tail_ratio=0.5)
+            reason = "AMD 분기: GPU 근접성을 유지하면서 초반 코어 과집중을 줄이도록 후반 코어 약우선 규칙을 적용했습니다."
         elif branch == "intel_legacy":
-            gpu_cores = primary_locality[: min(4, len(primary_locality))]
-            gpu_root_cores = primary_locality[1:3] or gpu_cores[:1]
-            side_cores = [x for x in rep_lps if x not in gpu_cores][:3]
+            gpu_cores = _tail_biased(primary_locality, min(4, len(primary_locality)), tail_ratio=0.5)
+            gpu_root_cores = _tail_biased([x for x in primary_locality if x not in gpu_cores], 2, tail_ratio=0.5) or gpu_cores[:1]
+            side_cores = _tail_biased([x for x in rep_lps if x not in gpu_cores], 3, tail_ratio=0.5)
             if not side_cores:
                 side_cores = gpu_root_cores[:]
-            reason = "Intel legacy branch: spread across uniform physical cores; GPU on primary locality, side devices on non-overlapping physical cores."
+            reason = "Intel 레거시 분기: 주 로컬리티의 균일 물리 코어에 후반 코어 약우선 규칙으로 분산 배치했습니다."
         else:
-            gpu_cores = primary_locality[: min(4, len(primary_locality))]
-            gpu_root_cores = primary_locality[1:3] or gpu_cores[:1]
-            side_cores = [x for x in rep_lps if x not in gpu_cores][:3]
+            gpu_cores = _tail_biased(primary_locality, min(4, len(primary_locality)), tail_ratio=0.5)
+            gpu_root_cores = _tail_biased([x for x in primary_locality if x not in gpu_cores], 2, tail_ratio=0.5) or gpu_cores[:1]
+            side_cores = _tail_biased([x for x in rep_lps if x not in gpu_cores], 3, tail_ratio=0.5)
             if not side_cores:
                 side_cores = gpu_root_cores[:]
-            reason = "Unknown CPU: locality-first conservative placement."
+            reason = "미확인 CPU: 로컬리티 우선의 보수적 배치와 후반 코어 약우선 규칙을 적용했습니다."
 
         def _sanitize(values, fallback):
             clean = []
@@ -778,39 +804,46 @@ class IRQOptimizerApp:
 
         labels = {
             "gpu": "GPU",
-            "gpu_root_port": "GPU Root Port",
-            "usb_controller": "USB Controller",
-            "audio": "Audio",
-            "storage": "Storage",
+            "gpu_root_port": "GPU 루트 포트",
+            "usb_controller": "USB 컨트롤러",
+            "audio": "오디오",
+            "storage": "스토리지",
             "nic": "NIC",
         }
+        profile_labels = {
+            "Balanced": "균형형",
+            "Low Latency": "저지연",
+            "Streaming": "스트리밍",
+        }
+        active_profile = self.get_active_profile_name()
+        active_profile_ko = profile_labels.get(active_profile, active_profile)
         summary = ", ".join(f"{labels.get(role, role)}: {len(role_groups.get(role, []))}" for role in role_order)
         priority_text = " → ".join(labels.get(role, role) for role in role_order)
         profile = self.get_active_profile()
 
         lines = [
-            f"Target device recommendation profile: {self.get_active_profile_name()}",
-            f"Profile note: {profile.get('description', '')}",
-            f"Target priority: {priority_text}",
-            f"Detected devices: {summary}",
-            f"Topology summary: Source {topo.get('topology_source', 'Fallback heuristic')}, "
-            f"Groups {topo.get('summary', {}).get('group_count', 1)}, "
-            f"NUMA nodes {topo.get('numa_node_count', 1)}, "
-            f"Primary locality {topo.get('primary_group', [])}",
-            f"Branch policy: {rec.get('branch', self.cpu_arch)}",
+            f"대상 장치 추천 프로필: {active_profile_ko} ({active_profile})",
+            f"프로필 설명: {profile.get('description', '')}",
+            f"대상 우선순위: {priority_text}",
+            f"감지된 장치 수: {summary}",
+            f"토폴로지 요약: 소스 {topo.get('topology_source', '휴리스틱 추정')}, "
+            f"그룹 {topo.get('summary', {}).get('group_count', 1)}, "
+            f"NUMA 노드 {topo.get('numa_node_count', 1)}, "
+            f"주 로컬리티 {topo.get('primary_group', [])}",
+            f"분기 정책: {rec.get('branch', self.cpu_arch)}",
             "",
-            "Core placement policy:",
-            f"- GPU: use primary nearby physical-core group {gpu_group}",
-            f"- GPU Root Port: prefer adjacent same-locality cores {root_group} (avoid forced single-core overlap)",
-            f"- USB Controller: prefer low-contention nearby side core(s) {side_group}",
-            f"- Audio/Storage/NIC: place on nearby but separate side cores when possible {side_group}",
+            "코어 배치 정책:",
+            f"- GPU: 1차 근접 물리 코어 그룹 {gpu_group} 우선",
+            f"- GPU 루트 포트: 동일 로컬리티 인접 코어 {root_group} 우선 (강제 단일 코어 중첩 회피)",
+            f"- USB 컨트롤러: 경합이 낮은 인접 사이드 코어 {side_group} 우선",
+            f"- 오디오/스토리지/NIC: 가능하면 분리된 인접 사이드 코어 {side_group} 사용",
             "",
-            f"Reasoning: {rec.get('reason', 'Topology-aware heuristic applied.')} "
-            "Forcing GPU and PCIe Root Port onto one identical core can increase IRQ contention.",
+            f"근거: {rec.get('reason', '토폴로지 인식 휴리스틱 적용')} "
+            "GPU와 PCIe 루트 포트를 동일 코어에 강제로 겹치면 IRQ 경합이 증가할 수 있습니다.",
         ]
         if self.group_limit_active:
             lines.append(
-                "Warning: Only processor group 0 is supported. Logical processors above 63 are hidden."
+                "주의: Processor Group 0만 지원하며, 63번 초과 논리 프로세서는 숨겨집니다."
             )
         return "\n".join(lines)
 
@@ -966,7 +999,7 @@ class IRQOptimizerApp:
             self.sidebar, height=240, font=ctk.CTkFont("Consolas", 10), wrap="word"
         )
         self.recommend_text.pack(fill=tk.X, padx=8, pady=(0, 14))
-        self.recommend_text.insert("1.0", "Recommendation will be generated after device scan.")
+        self.recommend_text.insert("1.0", "장치 스캔 후 추천 전략이 여기에 표시됩니다.")
         self.recommend_text.configure(state="disabled")
 
     def _toggle_topology(self):
@@ -1002,14 +1035,15 @@ class IRQOptimizerApp:
 
         columns = ("Name", "Class", "InstanceID")
         self.tree = ttk.Treeview(tree_wrap, columns=columns, show="headings", height=12, selectmode="extended")
-        self.tree.heading("Name", text="Device")
-        self.tree.heading("Class", text="Class")
+        self.tree.heading("Name", text="Device (Type Sort)", command=self.sort_devices_by_type)
+        self.tree.heading("Class", text="Class", command=self.sort_devices_by_type)
         self.tree.heading("InstanceID", text="InstanceID")
         self.tree.column("Name", width=580)
         self.tree.column("Class", width=130)
         self.tree.column("InstanceID", width=0, stretch=False)
         self.tree.grid(row=0, column=0, sticky="nsew")
         self.tree.bind("<<TreeviewSelect>>", self.on_device_select)
+        self.tree.bind("<Double-1>", self.on_device_double_click)
 
         vsb = ttk.Scrollbar(tree_wrap, orient="vertical", command=self.tree.yview)
         vsb.grid(row=0, column=1, sticky="ns")
@@ -1290,6 +1324,8 @@ $output | Sort-Object Name | ConvertTo-Json -Depth 3
                         tags=(tag,) if tag else (),
                     )
                     self.tree_item_by_instance[instance] = item_id
+                self._device_sort_desc = False
+                self.sort_devices_by_type(toggle=False)
                 self.update_recommendation_text()
                 status = f"Loaded {len(self.tree.get_children())} devices"
                 if self.group_limit_active:
@@ -1310,6 +1346,88 @@ $output | Sort-Object Name | ConvertTo-Json -Depth 3
             return
         self.current_instance_id = values[2]
         self.update_core_display_for_device(self.current_instance_id)
+
+    def _find_entry_by_instance_id(self, instance_id):
+        target = self._normalize_instance_id(instance_id)
+        for entry in self.device_entries:
+            if self._normalize_instance_id(entry.get("instance")) == target:
+                return entry
+        return None
+
+    def _get_primary_role_priority(self, roles):
+        ordered = self.get_active_role_order() + ["pcie_root_port"]
+        for idx, role in enumerate(ordered):
+            if role in roles:
+                return idx
+        return len(ordered)
+
+    def sort_devices_by_type(self, toggle=True):
+        items = list(self.tree.get_children(""))
+        if not items:
+            return
+        if toggle:
+            self._device_sort_desc = not self._device_sort_desc
+
+        sortable = []
+        for item_id in items:
+            values = self.tree.item(item_id, "values")
+            if len(values) < 3:
+                continue
+            disp_name, cls_name, instance = values[0], values[1], values[2]
+            roles = self.device_roles.get(self._normalize_instance_id(instance), set())
+            primary_priority = self._get_primary_role_priority(roles)
+            sortable.append(
+                (
+                    primary_priority,
+                    cls_name.lower(),
+                    disp_name.lower(),
+                    instance.lower(),
+                    item_id,
+                )
+            )
+
+        sortable.sort(reverse=self._device_sort_desc)
+        for idx, row in enumerate(sortable):
+            self.tree.move(row[-1], "", idx)
+
+        order_text = "descending" if self._device_sort_desc else "ascending"
+        self.status_var.set(f"Sorted devices by type ({order_text})")
+
+    def on_device_double_click(self, event):
+        item_id = self.tree.identify_row(event.y)
+        if not item_id:
+            return
+        self.tree.selection_set(item_id)
+        self.tree.focus(item_id)
+        self.on_device_select()
+
+        values = self.tree.item(item_id, "values")
+        if len(values) < 3:
+            return
+        instance_id = values[2]
+        entry = self._find_entry_by_instance_id(instance_id)
+        roles = self.device_roles.get(self._normalize_instance_id(instance_id), set())
+        role_text = self.role_label(roles) or "UNCLASSIFIED"
+
+        state = self.read_affinity_values(instance_id)
+        assignment = state.get("assignment")
+        if isinstance(assignment, (bytes, bytearray)):
+            affinity_mask = hex(int.from_bytes(assignment, byteorder="little", signed=False))
+        else:
+            affinity_mask = "Not set"
+        device_policy = state.get("device_policy")
+        policy_text = str(device_policy) if device_policy is not None else "Not set"
+
+        detail_lines = [
+            f"Name: {(entry or {}).get('name', values[0])}",
+            f"Type: {role_text}",
+            f"Class: {(entry or {}).get('class', values[1])}",
+            f"InstanceID: {instance_id}",
+            f"Parent InstanceID: {(entry or {}).get('parent') or 'N/A'}",
+            f"Current IRQ Mask: {affinity_mask}",
+            f"DevicePolicy: {policy_text}",
+        ]
+        messagebox.showinfo("Device Details", "\n".join(detail_lines))
 
     def get_selected_instance_ids(self):
         selected_items = self.tree.selection()

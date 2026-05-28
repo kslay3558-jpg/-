@@ -97,6 +97,7 @@ dist\IRQOptimizer.exe
   - `Balanced` : 게임·작업 혼용 환경
   - `Low Latency` : 경쟁 게임 등 낮은 지연 우선
   - `Streaming` : 방송/녹화 병행 환경
+- **기본 가이드 대상:** 코어 할당은 **그래픽 카드(GPU), 오디오 장치(AUDIO), 랜카드(NIC)** 중심으로 진행하세요.
 - **수동 선택:** 목록에서 장치를 하나 이상 선택할 수 있으며, **Apply to Selected**는 현재 선택된 모든 장치에 동일한 마스크를 적용합니다.
 
 ### 3단계 — CPU 코어 지정
@@ -140,11 +141,11 @@ C:\ProgramData\IRQOptimizer\irq_backup.json
 
 | 분기 | 해당 CPU | 배치 전략 |
 |---|---|---|
-| `intel_hybrid` | 12세대 이상 Core, Core Ultra | GPU·Root Port → P-코어 클러스터, 사이드 장치 → E-코어 |
-| `intel_legacy` | 11세대 이하 Core | GPU → 하위 물리 코어, 사이드 장치 → 균일 분산 |
-| `amd_dual_x3d` | Ryzen 7950X3D / 9950X3D 등 | GPU → 1차 CCD, 사이드 장치 → 2차 CCD |
-| `amd_single_x3d` | Ryzen 5800X3D / 7800X3D 등 | GPU → X3D 캐시 인접 코어, 사이드 장치 → 나머지 코어 |
-| `amd_generic` | 그 외 Ryzen / Threadripper | GPU → 하위 물리 코어, 사이드 장치 → 분리 배치 |
+| `intel_hybrid` | 12세대 이상 Core, Core Ultra | GPU → P-코어 중심 + 전반 코어 과집중 방지(후반 포함), 오디오/NIC → 비중첩 코어 |
+| `intel_legacy` | 11세대 이하 Core | GPU → 주 로컬리티 중심 + 후반 코어 우선 편향, 오디오/NIC → 분리 배치 |
+| `amd_dual_x3d` | Ryzen 7950X3D / 9950X3D 등 | GPU → CCD0 중심 + 후반 코어 포함, 오디오/NIC → CCD1 우선 |
+| `amd_single_x3d` | Ryzen 5800X3D / 7800X3D 등 | GPU → X3D 인접 + 후반 코어 편향, 오디오/NIC → 나머지 코어 |
+| `amd_generic` | 그 외 Ryzen / Threadripper | GPU → 주 로컬리티 후반 우선, 오디오/NIC → 분리 배치 |
 
 > 추천값은 참고용입니다. BIOS/드라이버 레벨 토폴로지를 완전히 반영하지 못할 수 있으므로,  
 > 적용 후 실제 체감을 비교하고 필요하면 수동으로 조정하세요.
@@ -154,7 +155,7 @@ C:\ProgramData\IRQOptimizer\irq_backup.json
 ## 주의 사항
 
 - 반드시 **관리자 권한**으로 실행하세요. 레지스트리 쓰기에 필요합니다.
-- 한 번에 모든 장치를 변경하지 말고, GPU/오디오 등 핵심 장치부터 순차적으로 적용하세요.
+- 한 번에 모든 장치를 변경하지 말고, **GPU → 오디오 → NIC** 순으로 핵심 장치부터 순차 적용하세요.
 - Processor Group 0의 최대 64개 논리 코어 범위만 지원합니다. 64개를 초과하는 시스템에서는 63번 초과 논리 프로세서는 UI에서 숨겨집니다.
 - 오버클럭·언더볼팅·백그라운드 앱 상태에 따라 결과 편차가 발생할 수 있습니다.
 - **Apply, Undo Focused, Reset Focused 모두 재부팅 후에 실제로 적용됩니다.**
