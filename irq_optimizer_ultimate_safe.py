@@ -48,6 +48,7 @@ class IRQOptimizerApp:
         self.device_entries = []
         self.device_roles = {}
         self.tree_item_by_instance = {}
+        self.preference_profiles = self.build_preference_profiles()
 
         program_data = os.environ.get("ProgramData", r"C:\ProgramData")
         backup_dir = os.path.join(program_data, "IRQOptimizer")
@@ -120,6 +121,46 @@ class IRQOptimizerApp:
                 return "amd_single_x3d"
             return "amd_generic"
         return "unknown"
+
+    @staticmethod
+    def build_preference_profiles():
+        return {
+            "Balanced": {
+                "role_order": ["gpu", "gpu_root_port", "usb_controller", "audio", "storage", "nic"],
+                "target_roles": {"gpu", "gpu_root_port", "usb_controller", "audio", "storage", "nic"},
+                "description": "General gaming balance for latency and stability.",
+            },
+            "Low Latency": {
+                "role_order": ["gpu", "usb_controller", "gpu_root_port", "nic", "audio", "storage"],
+                "target_roles": {"gpu", "gpu_root_port", "usb_controller", "nic", "audio"},
+                "description": "Prioritize input/network responsiveness; storage is lower priority.",
+            },
+            "Streaming": {
+                "role_order": ["gpu", "gpu_root_port", "audio", "nic", "usb_controller", "storage"],
+                "target_roles": {"gpu", "gpu_root_port", "audio", "nic", "usb_controller", "storage"},
+                "description": "Prioritize audio/network consistency for stream capture workloads.",
+            },
+        }
+
+    def get_active_profile_name(self):
+        if hasattr(self, "preference_profile_var"):
+            selected = self.preference_profile_var.get()
+            if selected in self.preference_profiles:
+                return selected
+        return "Balanced"
+
+    def get_active_profile(self):
+        return self.preference_profiles.get(self.get_active_profile_name(), self.preference_profiles["Balanced"])
+
+    def get_active_role_order(self):
+        return list(self.get_active_profile().get("role_order", []))
+
+    def get_active_target_roles(self):
+        return set(self.get_active_profile().get("target_roles", set()))
+
+    def on_profile_change(self, _event=None):
+        self.update_recommendation_text()
+        self.status_var.set(f"Preference profile set to {self.get_active_profile_name()}")
 
     def build_locality_groups(self):
         total = self.logical_processors
@@ -380,7 +421,9 @@ $numa = Get-CimInstance Win32_NumaNode | Select-Object NodeNumber,NumberOfLogica
             roles.add("nic")
 
         usb_controller_keys = ("xhci", "ehci", "host controller", "extensible host controller")
-        if cls_l == "usb" and any(k in name_l for k in usb_controller_keys):
+        if (cls_l == "usb" and any(k in name_l for k in usb_controller_keys)) or (
+            any(k in name_l for k in usb_controller_keys) and "controller" in name_l
+        ):
             roles.add("usb_controller")
 
         return roles
@@ -427,7 +470,8 @@ $numa = Get-CimInstance Win32_NumaNode | Select-Object NodeNumber,NumberOfLogica
         return "|".join(selected)
 
     def build_target_strategy_text(self):
-        role_groups = {"gpu": [], "gpu_root_port": [], "usb_controller": [], "audio": [], "storage": [], "nic": []}
+        role_order = self.get_active_role_order()
+        role_groups = {role: [] for role in role_order}
         for entry in self.device_entries:
             iid = self._normalize_instance_id(entry["instance"])
             roles = self.device_roles.get(iid, set())
@@ -452,11 +496,23 @@ $numa = Get-CimInstance Win32_NumaNode | Select-Object NodeNumber,NumberOfLogica
         if not side_group:
             side_group = [adjacent_core] if adjacent_core is not None else [gpu_group[0]]
 
+        labels = {
+            "gpu": "GPU",
+            "gpu_root_port": "GPU Root Port",
+            "usb_controller": "USB Controller",
+            "audio": "Audio",
+            "storage": "Storage",
+            "nic": "NIC",
+        }
+        summary = ", ".join(f"{labels.get(role, role)}: {len(role_groups.get(role, []))}" for role in role_order)
+        priority_text = " → ".join(labels.get(role, role) for role in role_order)
+        profile = self.get_active_profile()
+
         lines = [
-            "Target device recommendation (priority): GPU → GPU Root Port → USB Controller → Audio → Storage → NIC",
-            f"Detected GPU: {len(role_groups['gpu'])}, GPU Root Port: {len(role_groups['gpu_root_port'])}, "
-            f"USB Controller: {len(role_groups['usb_controller'])}, Audio: {len(role_groups['audio'])}, "
-            f"Storage: {len(role_groups['storage'])}, NIC: {len(role_groups['nic'])}",
+            f"Target device recommendation profile: {self.get_active_profile_name()}",
+            f"Profile note: {profile.get('description', '')}",
+            f"Target priority: {priority_text}",
+            f"Detected devices: {summary}",
             f"Topology summary: Sockets {topo.get('socket_count', 1)}, NUMA nodes {topo.get('numa_node_count', 1)}, "
             f"Primary locality {topo.get('primary_group', [])}",
             "",
@@ -481,9 +537,10 @@ $numa = Get-CimInstance Win32_NumaNode | Select-Object NodeNumber,NumberOfLogica
     def select_target_devices(self):
         self.tree.selection_remove(*self.tree.selection())
         selected_ids = []
+        target_roles = self.get_active_target_roles()
         for instance_id, item_id in self.tree_item_by_instance.items():
             roles = self.device_roles.get(self._normalize_instance_id(instance_id), set())
-            if roles & {"gpu", "gpu_root_port", "usb_controller", "audio", "storage", "nic"}:
+            if roles & target_roles:
                 selected_ids.append(item_id)
         for item_id in selected_ids:
             self.tree.selection_add(item_id)
@@ -491,7 +548,9 @@ $numa = Get-CimInstance Win32_NumaNode | Select-Object NodeNumber,NumberOfLogica
             self.tree.focus(selected_ids[0])
             self.tree.see(selected_ids[0])
             self.on_device_select()
-        self.status_var.set(f"Selected {len(selected_ids)} recommended target devices")
+        self.status_var.set(
+            f"Selected {len(selected_ids)} recommended target devices ({self.get_active_profile_name()})"
+        )
 
     def create_widgets(self):
         top_frame = tk.Frame(self.root)
@@ -524,6 +583,25 @@ $numa = Get-CimInstance Win32_NumaNode | Select-Object NodeNumber,NumberOfLogica
         tk.Button(controls, text="Apply", command=self.apply_affinity, width=12, bg="#16a34a", fg="white").pack(side=tk.LEFT, padx=4)
         tk.Button(controls, text="Factory Reset", command=self.factory_reset, width=14, bg="#dc2626", fg="white").pack(side=tk.LEFT, padx=4)
         tk.Button(controls, text="Undo Last", command=self.undo_last_change, width=12).pack(side=tk.LEFT, padx=4)
+
+        pref_box = tk.LabelFrame(self.root, text="Target Preference Profile")
+        pref_box.pack(fill=tk.X, padx=14, pady=(0, 6))
+        self.preference_profile_var = tk.StringVar(value="Balanced")
+        tk.Label(pref_box, text="Mode").pack(side=tk.LEFT, padx=(8, 4), pady=6)
+        profile_combo = ttk.Combobox(
+            pref_box,
+            textvariable=self.preference_profile_var,
+            values=list(self.preference_profiles.keys()),
+            state="readonly",
+            width=18,
+        )
+        profile_combo.pack(side=tk.LEFT, padx=4, pady=6)
+        profile_combo.bind("<<ComboboxSelected>>", self.on_profile_change)
+        tk.Label(
+            pref_box,
+            text="Switch profile, then click 'Select Target Devices' to apply role preference.",
+            fg="#334155",
+        ).pack(side=tk.LEFT, padx=8)
 
         cpu_box = tk.LabelFrame(self.root, text="CPU Topology")
         cpu_box.pack(fill=tk.X, padx=14, pady=6)

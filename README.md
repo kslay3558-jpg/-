@@ -59,12 +59,13 @@ python irq_optimizer_ultimate_safe.py
 ### 1) 장치 스캔
 
 - `Refresh Devices` 클릭
-- 장치 목록이 로드되면 역할 태그(`[GPU]`, `[GPU-ROOT]`, `[AUDIO]`, `[STORAGE]`, `[NIC]`)를 확인
+- 장치 목록이 로드되면 역할 태그(`[GPU]`, `[GPU-ROOT]`, `[USB]`, `[AUDIO]`, `[STORAGE]`, `[NIC]`)를 확인
 
 ### 2) 대상 장치 자동 선택(권장)
 
+- `Target Preference Profile`에서 모드 선택 (`Balanced`, `Low Latency`, `Streaming`)
 - `Select Target Devices` 클릭
-- IRQ 튜닝 우선 대상(GPU → GPU Root Port → Audio → Storage → NIC)이 자동 선택됨
+- 선택한 프로필 기준 우선 대상(예: GPU/USB/GPU Root Port 등)이 자동 선택됨
 
 ### 3) 코어 선택
 
