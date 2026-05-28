@@ -52,8 +52,8 @@ python irq_optimizer_ultimate_safe.py
 2. 저장소 루트에서 아래 명령 실행
 
 ```bash
-pip install pyinstaller customtkinter
-pyinstaller build.spec
+python -m pip install pyinstaller customtkinter
+python -m PyInstaller build.spec
 ```
 
 출력 파일:
