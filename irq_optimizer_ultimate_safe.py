@@ -210,19 +210,19 @@ class IRQOptimizerApp:
     def build_preference_profiles():
         return {
             "Balanced": {
-                "role_order": ["gpu", "gpu_root_port", "usb_controller", "audio", "storage", "nic"],
-                "target_roles": {"gpu", "gpu_root_port", "usb_controller", "audio", "storage", "nic"},
-                "description": "General gaming balance for latency and stability.",
+                "role_order": ["gpu", "audio", "nic"],
+                "target_roles": {"gpu", "audio", "nic"},
+                "description": "General gaming baseline focused on GPU, audio, and network adapters.",
             },
             "Low Latency": {
-                "role_order": ["gpu", "usb_controller", "gpu_root_port", "nic", "audio", "storage"],
-                "target_roles": {"gpu", "gpu_root_port", "usb_controller", "nic", "audio"},
-                "description": "Prioritize input/network responsiveness; storage is lower priority.",
+                "role_order": ["gpu", "nic", "audio"],
+                "target_roles": {"gpu", "audio", "nic"},
+                "description": "Prioritize input/network responsiveness with GPU, NIC, and audio only.",
             },
             "Streaming": {
-                "role_order": ["gpu", "gpu_root_port", "audio", "nic", "usb_controller", "storage"],
-                "target_roles": {"gpu", "gpu_root_port", "audio", "nic", "usb_controller", "storage"},
-                "description": "Prioritize audio/network consistency for stream capture workloads.",
+                "role_order": ["gpu", "audio", "nic"],
+                "target_roles": {"gpu", "audio", "nic"},
+                "description": "Prioritize stream consistency for GPU, audio, and network devices.",
             },
         }
 
@@ -441,6 +441,23 @@ class IRQOptimizerApp:
         branch = self.cpu_arch
         reason = "Fallback conservative placement was applied."
 
+        def _tail_biased(values, limit, tail_ratio=0.5):
+            ordered = []
+            for v in values:
+                if isinstance(v, int) and 0 <= v < total and v not in ordered:
+                    ordered.append(v)
+            if not ordered:
+                return []
+            if len(ordered) <= limit:
+                return ordered
+            start = min(len(ordered) - 1, max(0, int(len(ordered) * tail_ratio)))
+            tail = ordered[start:]
+            if len(tail) >= limit:
+                return tail[:limit]
+            need = limit - len(tail)
+            prefix = ordered[max(0, start - need):start]
+            return prefix + tail
+
         if branch == "intel_hybrid":
             eff_map = topo.get("efficiency_class_map_group0", {}) or {}
             if eff_map:
@@ -453,39 +470,47 @@ class IRQOptimizerApp:
                 e_cores = [x for x in rep_lps if x not in p_cores]
             p_primary = [x for x in primary_locality if x in p_cores]
             e_secondary = [x for x in secondary_locality if x in e_cores]
-            gpu_cores = p_primary[: min(6, len(p_primary))] or p_cores[: min(4, len(p_cores))] or primary_locality[: min(4, len(primary_locality))]
-            gpu_root_cores = p_cores[1:3] or gpu_cores[:1]
-            side_cores = e_secondary[:3] or e_cores[:3] or [x for x in p_cores if x not in gpu_cores][:3]
-            reason = "Intel hybrid branch: efficiency-class-aware placement (P-like class first), while side devices prefer non-overlapping cores."
+            gpu_cores = (
+                _tail_biased(p_primary, min(6, len(p_primary)), tail_ratio=0.5)
+                or _tail_biased(p_cores, min(4, len(p_cores)), tail_ratio=0.5)
+                or _tail_biased(primary_locality, min(4, len(primary_locality)), tail_ratio=0.5)
+            )
+            gpu_root_cores = _tail_biased([x for x in p_cores if x not in gpu_cores], 2, tail_ratio=0.5) or gpu_cores[:1]
+            side_cores = (
+                _tail_biased(e_secondary, 3, tail_ratio=0.5)
+                or _tail_biased(e_cores, 3, tail_ratio=0.5)
+                or _tail_biased([x for x in p_cores if x not in gpu_cores], 3, tail_ratio=0.5)
+            )
+            reason = "Intel hybrid branch: P-core-aware placement with a mild tail bias to avoid concentrating on only the earliest P-cores."
         elif branch == "amd_dual_x3d":
             ccd0 = primary_locality or rep_lps[: max(1, len(rep_lps) // 2)]
             ccd1 = secondary_locality or [x for x in rep_lps if x not in ccd0]
-            gpu_cores = ccd0[: min(6, len(ccd0))]
-            gpu_root_cores = ccd0[1:3] or gpu_cores[:1]
-            side_cores = ccd1[:3] or [x for x in ccd0 if x not in gpu_cores][:3]
-            reason = "AMD dual-CCD/X3D branch: NUMA/locality-first spread with conservative fallback heuristics."
+            gpu_cores = _tail_biased(ccd0, min(6, len(ccd0)), tail_ratio=0.5)
+            gpu_root_cores = _tail_biased([x for x in ccd0 if x not in gpu_cores], 2, tail_ratio=0.5) or gpu_cores[:1]
+            side_cores = _tail_biased(ccd1, 3, tail_ratio=0.5) or _tail_biased([x for x in ccd0 if x not in gpu_cores], 3, tail_ratio=0.5)
+            reason = "AMD dual-CCD/X3D branch: locality-first split with a mild CCD0 tail bias for GPU-related cores."
         elif branch in {"amd_single_x3d", "amd_generic"}:
             gpu_span = 6 if branch == "amd_single_x3d" else 4
-            gpu_cores = primary_locality[: min(gpu_span, len(primary_locality))]
-            gpu_root_cores = primary_locality[1:3] or gpu_cores[:1]
-            side_cores = [x for x in rep_lps if x not in gpu_cores][:3]
+            gpu_cores = _tail_biased(primary_locality, min(gpu_span, len(primary_locality)), tail_ratio=0.5)
+            gpu_root_cores = _tail_biased([x for x in primary_locality if x not in gpu_cores], 2, tail_ratio=0.5) or gpu_cores[:1]
+            side_cores = _tail_biased([x for x in rep_lps if x not in gpu_cores], 3, tail_ratio=0.5)
             if not side_cores:
-                side_cores = primary_locality[::2][:3]
-            reason = "AMD branch: GPU proximity is maintained while side devices are split to reduce IRQ contention."
+                side_cores = _tail_biased(primary_locality[::2], 3, tail_ratio=0.5)
+            reason = "AMD branch: GPU proximity is maintained while reducing front-core concentration with a mild tail bias."
         elif branch == "intel_legacy":
-            gpu_cores = primary_locality[: min(4, len(primary_locality))]
-            gpu_root_cores = primary_locality[1:3] or gpu_cores[:1]
-            side_cores = [x for x in rep_lps if x not in gpu_cores][:3]
+            gpu_cores = _tail_biased(primary_locality, min(4, len(primary_locality)), tail_ratio=0.5)
+            gpu_root_cores = _tail_biased([x for x in primary_locality if x not in gpu_cores], 2, tail_ratio=0.5) or gpu_cores[:1]
+            side_cores = _tail_biased([x for x in rep_lps if x not in gpu_cores], 3, tail_ratio=0.5)
             if not side_cores:
                 side_cores = gpu_root_cores[:]
-            reason = "Intel legacy branch: spread across uniform physical cores; GPU on primary locality, side devices on non-overlapping physical cores."
+            reason = "Intel legacy branch: spread across uniform physical cores with a mild tail bias in primary locality."
         else:
-            gpu_cores = primary_locality[: min(4, len(primary_locality))]
-            gpu_root_cores = primary_locality[1:3] or gpu_cores[:1]
-            side_cores = [x for x in rep_lps if x not in gpu_cores][:3]
+            gpu_cores = _tail_biased(primary_locality, min(4, len(primary_locality)), tail_ratio=0.5)
+            gpu_root_cores = _tail_biased([x for x in primary_locality if x not in gpu_cores], 2, tail_ratio=0.5) or gpu_cores[:1]
+            side_cores = _tail_biased([x for x in rep_lps if x not in gpu_cores], 3, tail_ratio=0.5)
             if not side_cores:
                 side_cores = gpu_root_cores[:]
-            reason = "Unknown CPU: locality-first conservative placement."
+            reason = "Unknown CPU: locality-first conservative placement with a mild tail bias."
 
         def _sanitize(values, fallback):
             clean = []
