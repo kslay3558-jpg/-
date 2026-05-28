@@ -59,6 +59,8 @@ class IRQOptimizerApp:
         self.logical_processors = max(1, min(self.logical_processors, self.MAX_GROUP_CORES))
         self.is_smt_enabled = self.logical_processors > self.physical_cores
         self.cpu_arch = self.classify_cpu()
+        self.locality_groups = self.build_locality_groups()
+        self.topology_snapshot = self.get_topology_snapshot()
 
         self.create_widgets()
         self.load_devices()
@@ -119,13 +121,86 @@ class IRQOptimizerApp:
             return "amd_generic"
         return "unknown"
 
+    def build_locality_groups(self):
+        total = self.logical_processors
+        if total <= 1:
+            return [[0]]
+
+        phys_limit = min(max(1, self.physical_cores), total)
+        physical_cores = list(range(phys_limit))
+
+        if self.cpu_arch == "amd_dual_x3d" and phys_limit >= 8:
+            split = max(1, phys_limit // 2)
+            groups = [physical_cores[:split], physical_cores[split:]]
+            return [g for g in groups if g]
+
+        if self.cpu_arch == "intel_hybrid" and phys_limit >= 6:
+            p_core_guess = max(2, phys_limit // 2)
+            groups = [physical_cores[:p_core_guess], physical_cores[p_core_guess:]]
+            return [g for g in groups if g]
+
+        return [physical_cores]
+
+    def get_topology_snapshot(self):
+        fallback = {
+            "socket_count": 1,
+            "numa_node_count": 1,
+            "numa_logical_processors": [self.logical_processors],
+            "locality_groups": [list(g) for g in self.locality_groups],
+            "primary_group": list(self.locality_groups[0]) if self.locality_groups else [0],
+            "secondary_group": list(self.locality_groups[1][:2]) if len(self.locality_groups) > 1 else [],
+        }
+        try:
+            script = r"""
+$processors = Get-CimInstance Win32_Processor | Select-Object Name,Manufacturer,NumberOfCores,NumberOfLogicalProcessors
+$numa = Get-CimInstance Win32_NumaNode | Select-Object NodeNumber,NumberOfLogicalProcessors
+[PSCustomObject]@{
+  Processors = $processors
+  NumaNodes = $numa
+} | ConvertTo-Json -Depth 5
+""".strip()
+            result = self._run_powershell(script)
+            if result.returncode != 0 or not result.stdout.strip():
+                return fallback
+
+            data = json.loads(result.stdout.strip())
+            procs = data.get("Processors") if isinstance(data, dict) else None
+            numa = data.get("NumaNodes") if isinstance(data, dict) else None
+
+            if isinstance(procs, dict):
+                procs = [procs]
+            if isinstance(numa, dict):
+                numa = [numa]
+
+            socket_count = len(procs) if isinstance(procs, list) and procs else 1
+            numa_nodes = (
+                [int(x.get("NumberOfLogicalProcessors", 0) or 0) for x in numa]
+                if isinstance(numa, list)
+                else []
+            )
+            numa_nodes = [x for x in numa_nodes if x > 0]
+            numa_node_count = max(1, len(numa_nodes))
+
+            snapshot = dict(fallback)
+            snapshot["socket_count"] = socket_count
+            snapshot["numa_node_count"] = numa_node_count
+            snapshot["numa_logical_processors"] = (
+                numa_nodes if numa_nodes else [self.logical_processors]
+            )
+            return snapshot
+        except Exception:
+            return fallback
+
     def analyze_cpu_topology(self):
         smt = "On" if self.is_smt_enabled else "Off"
+        topo = self.topology_snapshot or {}
         guide = (
             f"CPU: {self.cpu_info}\n"
             f"Cores: Physical {self.physical_cores} / Logical {self.logical_processors}\n"
             f"SMT/HT: {smt}\n"
-            f"Architecture profile: {self.cpu_arch}\n\n"
+            f"Architecture profile: {self.cpu_arch}\n"
+            f"Sockets: {topo.get('socket_count', 1)}, NUMA nodes: {topo.get('numa_node_count', 1)}\n"
+            f"Locality groups: {topo.get('locality_groups', self.locality_groups)}\n\n"
         )
         msg = {
             "intel_hybrid": "Recommended cores focus on likely P-cores (typically lower index cores).",
@@ -253,6 +328,14 @@ class IRQOptimizerApp:
         self.save_backup(backup)
 
     def get_recommended_cores(self):
+        topo = self.topology_snapshot or {}
+        primary_group = [x for x in topo.get("primary_group", []) if 0 <= x < self.logical_processors]
+        if primary_group:
+            if self.is_smt_enabled and len(primary_group) >= 4:
+                reduced = primary_group[::2]
+                return reduced or [primary_group[0]]
+            return primary_group
+
         total = self.logical_processors
         if total <= 2:
             return list(range(total))
@@ -296,6 +379,10 @@ class IRQOptimizerApp:
         if cls_l == "net" or any(k in name_l for k in nic_keys):
             roles.add("nic")
 
+        usb_controller_keys = ("xhci", "ehci", "host controller", "extensible host controller")
+        if cls_l == "usb" and any(k in name_l for k in usb_controller_keys):
+            roles.add("usb_controller")
+
         return roles
 
     def build_device_role_map(self, entries):
@@ -326,10 +413,11 @@ class IRQOptimizerApp:
 
     @staticmethod
     def role_label(roles):
-        order = ["gpu", "gpu_root_port", "audio", "storage", "nic", "pcie_root_port"]
+        order = ["gpu", "gpu_root_port", "usb_controller", "audio", "storage", "nic", "pcie_root_port"]
         labels = {
             "gpu": "GPU",
             "gpu_root_port": "GPU-ROOT",
+            "usb_controller": "USB",
             "audio": "AUDIO",
             "storage": "STORAGE",
             "nic": "NIC",
@@ -339,7 +427,7 @@ class IRQOptimizerApp:
         return "|".join(selected)
 
     def build_target_strategy_text(self):
-        role_groups = {"gpu": [], "gpu_root_port": [], "audio": [], "storage": [], "nic": []}
+        role_groups = {"gpu": [], "gpu_root_port": [], "usb_controller": [], "audio": [], "storage": [], "nic": []}
         for entry in self.device_entries:
             iid = self._normalize_instance_id(entry["instance"])
             roles = self.device_roles.get(iid, set())
@@ -347,8 +435,10 @@ class IRQOptimizerApp:
                 if role in roles:
                     role_groups[role].append(entry["name"])
 
+        topo = self.topology_snapshot or {}
         base = self.get_recommended_cores()
-        gpu_group = base[: min(4, len(base))]
+        primary = [x for x in topo.get("primary_group", []) if x in base]
+        gpu_group = (primary or base)[: min(4, len(primary or base))]
         if not gpu_group:
             gpu_group = [0]
 
@@ -357,19 +447,24 @@ class IRQOptimizerApp:
             candidate = gpu_group[-1] + 1
             adjacent_core = candidate if candidate < self.logical_processors else max(0, gpu_group[0] - 1)
 
-        side_group = [x for x in base if x not in gpu_group][:2]
+        secondary = [x for x in topo.get("secondary_group", []) if 0 <= x < self.logical_processors]
+        side_group = secondary or [x for x in base if x not in gpu_group][:2]
         if not side_group:
             side_group = [adjacent_core] if adjacent_core is not None else [gpu_group[0]]
 
         lines = [
-            "Target device recommendation (priority): GPU → GPU Root Port → Audio → Storage → NIC",
+            "Target device recommendation (priority): GPU → GPU Root Port → USB Controller → Audio → Storage → NIC",
             f"Detected GPU: {len(role_groups['gpu'])}, GPU Root Port: {len(role_groups['gpu_root_port'])}, "
-            f"Audio: {len(role_groups['audio'])}, Storage: {len(role_groups['storage'])}, NIC: {len(role_groups['nic'])}",
+            f"USB Controller: {len(role_groups['usb_controller'])}, Audio: {len(role_groups['audio'])}, "
+            f"Storage: {len(role_groups['storage'])}, NIC: {len(role_groups['nic'])}",
+            f"Topology summary: Sockets {topo.get('socket_count', 1)}, NUMA nodes {topo.get('numa_node_count', 1)}, "
+            f"Primary locality {topo.get('primary_group', [])}",
             "",
             "Core placement policy:",
             f"- GPU: use primary nearby physical-core group {gpu_group}",
             "- GPU Root Port: prefer adjacent core(s) in same locality (not forced to exact same single core)",
             f"  Suggested adjacent core: {adjacent_core if adjacent_core is not None else gpu_group[0]}",
+            f"- USB Controller: prefer low-contention nearby side core(s) {side_group}",
             f"- Audio/Storage/NIC: place on nearby but separate side cores when possible {side_group}",
             "",
             "Reasoning: forcing GPU and PCIe Root Port onto one identical core can increase IRQ contention.",
@@ -388,7 +483,7 @@ class IRQOptimizerApp:
         selected_ids = []
         for instance_id, item_id in self.tree_item_by_instance.items():
             roles = self.device_roles.get(self._normalize_instance_id(instance_id), set())
-            if roles & {"gpu", "gpu_root_port", "audio", "storage", "nic"}:
+            if roles & {"gpu", "gpu_root_port", "usb_controller", "audio", "storage", "nic"}:
                 selected_ids.append(item_id)
         for item_id in selected_ids:
             self.tree.selection_add(item_id)
