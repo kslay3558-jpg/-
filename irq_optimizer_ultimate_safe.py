@@ -90,6 +90,7 @@ class IRQOptimizerApp:
         self.device_entries = []
         self.device_roles = {}
         self.tree_item_by_instance = {}
+        self._device_sort_desc = False
         self.preference_profiles = self.build_preference_profiles()
         self.powershell_executable = self._resolve_powershell_executable()
 
@@ -1002,14 +1003,15 @@ class IRQOptimizerApp:
 
         columns = ("Name", "Class", "InstanceID")
         self.tree = ttk.Treeview(tree_wrap, columns=columns, show="headings", height=12, selectmode="extended")
-        self.tree.heading("Name", text="Device")
-        self.tree.heading("Class", text="Class")
+        self.tree.heading("Name", text="Device (Type Sort)", command=self.sort_devices_by_type)
+        self.tree.heading("Class", text="Class", command=self.sort_devices_by_type)
         self.tree.heading("InstanceID", text="InstanceID")
         self.tree.column("Name", width=580)
         self.tree.column("Class", width=130)
         self.tree.column("InstanceID", width=0, stretch=False)
         self.tree.grid(row=0, column=0, sticky="nsew")
         self.tree.bind("<<TreeviewSelect>>", self.on_device_select)
+        self.tree.bind("<Double-1>", self.on_device_double_click)
 
         vsb = ttk.Scrollbar(tree_wrap, orient="vertical", command=self.tree.yview)
         vsb.grid(row=0, column=1, sticky="ns")
@@ -1290,6 +1292,8 @@ $output | Sort-Object Name | ConvertTo-Json -Depth 3
                         tags=(tag,) if tag else (),
                     )
                     self.tree_item_by_instance[instance] = item_id
+                self._device_sort_desc = False
+                self.sort_devices_by_type(toggle=False)
                 self.update_recommendation_text()
                 status = f"Loaded {len(self.tree.get_children())} devices"
                 if self.group_limit_active:
@@ -1310,6 +1314,88 @@ $output | Sort-Object Name | ConvertTo-Json -Depth 3
             return
         self.current_instance_id = values[2]
         self.update_core_display_for_device(self.current_instance_id)
+
+    def _find_entry_by_instance_id(self, instance_id):
+        target = self._normalize_instance_id(instance_id)
+        for entry in self.device_entries:
+            if self._normalize_instance_id(entry.get("instance")) == target:
+                return entry
+        return None
+
+    def _get_primary_role_priority(self, roles):
+        ordered = self.get_active_role_order() + ["pcie_root_port"]
+        for idx, role in enumerate(ordered):
+            if role in roles:
+                return idx
+        return len(ordered)
+
+    def sort_devices_by_type(self, toggle=True):
+        items = list(self.tree.get_children(""))
+        if not items:
+            return
+        if toggle:
+            self._device_sort_desc = not self._device_sort_desc
+
+        sortable = []
+        for item_id in items:
+            values = self.tree.item(item_id, "values")
+            if len(values) < 3:
+                continue
+            disp_name, cls_name, instance = values[0], values[1], values[2]
+            roles = self.device_roles.get(self._normalize_instance_id(instance), set())
+            primary_priority = self._get_primary_role_priority(roles)
+            sortable.append(
+                (
+                    primary_priority,
+                    cls_name.lower(),
+                    disp_name.lower(),
+                    instance.lower(),
+                    item_id,
+                )
+            )
+
+        sortable.sort(reverse=self._device_sort_desc)
+        for idx, row in enumerate(sortable):
+            self.tree.move(row[-1], "", idx)
+
+        order_text = "descending" if self._device_sort_desc else "ascending"
+        self.status_var.set(f"Sorted devices by type ({order_text})")
+
+    def on_device_double_click(self, event):
+        item_id = self.tree.identify_row(event.y)
+        if not item_id:
+            return
+        self.tree.selection_set(item_id)
+        self.tree.focus(item_id)
+        self.on_device_select()
+
+        values = self.tree.item(item_id, "values")
+        if len(values) < 3:
+            return
+        instance_id = values[2]
+        entry = self._find_entry_by_instance_id(instance_id)
+        roles = self.device_roles.get(self._normalize_instance_id(instance_id), set())
+        role_text = self.role_label(roles) or "UNCLASSIFIED"
+
+        state = self.read_affinity_values(instance_id)
+        assignment = state.get("assignment")
+        if isinstance(assignment, (bytes, bytearray)):
+            affinity_mask = hex(int.from_bytes(assignment, byteorder="little", signed=False))
+        else:
+            affinity_mask = "Not set"
+        device_policy = state.get("device_policy")
+        policy_text = str(device_policy) if device_policy is not None else "Not set"
+
+        detail_lines = [
+            f"Name: {(entry or {}).get('name', values[0])}",
+            f"Type: {role_text}",
+            f"Class: {(entry or {}).get('class', values[1])}",
+            f"InstanceID: {instance_id}",
+            f"Parent InstanceID: {(entry or {}).get('parent') or 'N/A'}",
+            f"Current IRQ Mask: {affinity_mask}",
+            f"DevicePolicy: {policy_text}",
+        ]
+        messagebox.showinfo("Device Details", "\n".join(detail_lines))
 
     def get_selected_instance_ids(self):
         selected_items = self.tree.selection()
