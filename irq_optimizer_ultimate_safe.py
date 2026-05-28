@@ -62,6 +62,7 @@ class IRQOptimizerApp:
         self.cpu_arch = self.classify_cpu()
         self.locality_groups = self.build_locality_groups()
         self.topology_snapshot = self.get_topology_snapshot()
+        self.recommendation_sets = self.derive_topology_recommendation()
 
         self.create_widgets()
         self.load_devices()
@@ -232,14 +233,112 @@ $numa = Get-CimInstance Win32_NumaNode | Select-Object NodeNumber,NumberOfLogica
         except Exception:
             return fallback
 
+    def derive_topology_recommendation(self):
+        total = self.logical_processors
+        if total <= 1:
+            return {
+                "branch": "single_core_fallback",
+                "base_cores": [0],
+                "gpu_cores": [0],
+                "gpu_root_cores": [0],
+                "side_cores": [0],
+                "reason": "Single logical processor detected; use CPU 0 for all targets.",
+            }
+
+        phys_limit = min(max(1, self.physical_cores), total)
+        physical_cores = list(range(phys_limit))
+        topo = self.topology_snapshot or {}
+
+        locality_groups = []
+        for grp in topo.get("locality_groups", self.locality_groups):
+            norm = [x for x in grp if isinstance(x, int) and 0 <= x < phys_limit]
+            if norm:
+                locality_groups.append(norm)
+        if not locality_groups:
+            locality_groups = [physical_cores]
+
+        primary_locality = locality_groups[0]
+        secondary_locality = locality_groups[1] if len(locality_groups) > 1 else []
+        remaining = [x for x in physical_cores if x not in primary_locality]
+        if not secondary_locality:
+            secondary_locality = remaining
+
+        gpu_cores = []
+        gpu_root_cores = []
+        side_cores = []
+        branch = self.cpu_arch
+        reason = "Fallback conservative placement was applied."
+
+        if branch == "intel_hybrid":
+            p_core_count = max(2, min(phys_limit, (phys_limit * 2) // 3))
+            p_cores = physical_cores[:p_core_count]
+            e_cores = [x for x in physical_cores if x not in p_cores]
+            gpu_cores = p_cores[: min(6, len(p_cores))] or primary_locality[: min(4, len(primary_locality))]
+            gpu_root_cores = p_cores[1:3] or gpu_cores[:1]
+            side_cores = e_cores[:3] or [x for x in p_cores if x not in gpu_cores][:3]
+            reason = "Intel hybrid branch: GPU favors P-core cluster, side devices prefer E-core/adjacent cores."
+        elif branch == "amd_dual_x3d":
+            ccd0 = primary_locality or physical_cores[: max(1, phys_limit // 2)]
+            ccd1 = secondary_locality or [x for x in physical_cores if x not in ccd0]
+            gpu_cores = ccd0[: min(6, len(ccd0))]
+            gpu_root_cores = ccd0[1:3] or gpu_cores[:1]
+            side_cores = ccd1[:3] or [x for x in ccd0 if x not in gpu_cores][:3]
+            reason = "AMD dual-CCD/X3D branch: GPU and root port stay on primary CCD, side devices shift to secondary CCD."
+        elif branch in {"amd_single_x3d", "amd_generic"}:
+            gpu_span = 6 if branch == "amd_single_x3d" else 4
+            gpu_cores = primary_locality[: min(gpu_span, len(primary_locality))]
+            gpu_root_cores = primary_locality[1:3] or gpu_cores[:1]
+            side_cores = [x for x in physical_cores if x not in gpu_cores][:3]
+            if not side_cores:
+                side_cores = primary_locality[::2][:3]
+            reason = "AMD branch: GPU proximity is maintained while side devices are split to reduce IRQ contention."
+        else:
+            gpu_cores = primary_locality[: min(4, len(primary_locality))]
+            gpu_root_cores = primary_locality[1:3] or gpu_cores[:1]
+            side_cores = [x for x in physical_cores if x not in gpu_cores][:3]
+            if not side_cores:
+                side_cores = gpu_root_cores[:]
+            reason = "Unknown CPU branch: locality-first conservative placement."
+
+        def _sanitize(values, fallback):
+            clean = []
+            for v in values:
+                if isinstance(v, int) and 0 <= v < total and v not in clean:
+                    clean.append(v)
+            if clean:
+                return clean
+            return [fallback]
+
+        gpu_cores = _sanitize(gpu_cores, 0)
+        gpu_root_cores = _sanitize(gpu_root_cores, gpu_cores[0])
+        side_cores = _sanitize(side_cores, gpu_root_cores[0])
+
+        base_cores = []
+        for core in gpu_cores + side_cores:
+            if core not in base_cores:
+                base_cores.append(core)
+        if self.is_smt_enabled and len(base_cores) >= 4:
+            base_cores = base_cores[::2] or [base_cores[0]]
+
+        return {
+            "branch": branch,
+            "base_cores": _sanitize(base_cores, gpu_cores[0]),
+            "gpu_cores": gpu_cores,
+            "gpu_root_cores": gpu_root_cores,
+            "side_cores": side_cores,
+            "reason": reason,
+        }
+
     def analyze_cpu_topology(self):
         smt = "On" if self.is_smt_enabled else "Off"
         topo = self.topology_snapshot or {}
+        rec = self.recommendation_sets or {}
         guide = (
             f"CPU: {self.cpu_info}\n"
             f"Cores: Physical {self.physical_cores} / Logical {self.logical_processors}\n"
             f"SMT/HT: {smt}\n"
             f"Architecture profile: {self.cpu_arch}\n"
+            f"Recommendation branch: {rec.get('branch', self.cpu_arch)}\n"
             f"Sockets: {topo.get('socket_count', 1)}, NUMA nodes: {topo.get('numa_node_count', 1)}\n"
             f"Locality groups: {topo.get('locality_groups', self.locality_groups)}\n\n"
         )
@@ -369,26 +468,11 @@ $numa = Get-CimInstance Win32_NumaNode | Select-Object NodeNumber,NumberOfLogica
         self.save_backup(backup)
 
     def get_recommended_cores(self):
-        topo = self.topology_snapshot or {}
-        primary_group = [x for x in topo.get("primary_group", []) if 0 <= x < self.logical_processors]
-        if primary_group:
-            if self.is_smt_enabled and len(primary_group) >= 4:
-                reduced = primary_group[::2]
-                return reduced or [primary_group[0]]
-            return primary_group
-
-        total = self.logical_processors
-        if total <= 2:
-            return list(range(total))
-
-        phys_limit = min(max(1, self.physical_cores), total)
-
-        if self.cpu_arch in {"intel_hybrid", "amd_dual_x3d"}:
-            return list(range(min(phys_limit, max(2, total // 2))))
-
-        step = 2 if self.is_smt_enabled and total >= 4 else 1
-        rec = list(range(0, phys_limit, step))
-        return rec or [0]
+        rec = self.recommendation_sets or {}
+        base = rec.get("base_cores")
+        if isinstance(base, list) and base:
+            return [x for x in base if isinstance(x, int) and 0 <= x < self.logical_processors] or [0]
+        return [0]
 
     @staticmethod
     def _normalize_instance_id(instance_id):
@@ -480,21 +564,11 @@ $numa = Get-CimInstance Win32_NumaNode | Select-Object NodeNumber,NumberOfLogica
                     role_groups[role].append(entry["name"])
 
         topo = self.topology_snapshot or {}
+        rec = self.recommendation_sets or {}
         base = self.get_recommended_cores()
-        primary = [x for x in topo.get("primary_group", []) if x in base]
-        gpu_group = (primary or base)[: min(4, len(primary or base))]
-        if not gpu_group:
-            gpu_group = [0]
-
-        adjacent_core = None
-        if self.logical_processors > 1:
-            candidate = gpu_group[-1] + 1
-            adjacent_core = candidate if candidate < self.logical_processors else max(0, gpu_group[0] - 1)
-
-        secondary = [x for x in topo.get("secondary_group", []) if 0 <= x < self.logical_processors]
-        side_group = secondary or [x for x in base if x not in gpu_group][:2]
-        if not side_group:
-            side_group = [adjacent_core] if adjacent_core is not None else [gpu_group[0]]
+        gpu_group = rec.get("gpu_cores", base)[: min(4, len(rec.get("gpu_cores", base)))] or [0]
+        root_group = rec.get("gpu_root_cores", gpu_group[:1])[:2] or [gpu_group[0]]
+        side_group = rec.get("side_cores", [x for x in base if x not in gpu_group][:2])[:3] or [gpu_group[0]]
 
         labels = {
             "gpu": "GPU",
@@ -515,16 +589,16 @@ $numa = Get-CimInstance Win32_NumaNode | Select-Object NodeNumber,NumberOfLogica
             f"Detected devices: {summary}",
             f"Topology summary: Sockets {topo.get('socket_count', 1)}, NUMA nodes {topo.get('numa_node_count', 1)}, "
             f"Primary locality {topo.get('primary_group', [])}",
+            f"Branch policy: {rec.get('branch', self.cpu_arch)}",
             "",
             "Core placement policy:",
             f"- GPU: use primary nearby physical-core group {gpu_group}",
-            "- GPU Root Port: prefer adjacent core(s) in same locality (not forced to exact same single core)",
-            f"  Suggested adjacent core: {adjacent_core if adjacent_core is not None else gpu_group[0]}",
+            f"- GPU Root Port: prefer adjacent same-locality cores {root_group} (avoid forced single-core overlap)",
             f"- USB Controller: prefer low-contention nearby side core(s) {side_group}",
             f"- Audio/Storage/NIC: place on nearby but separate side cores when possible {side_group}",
             "",
-            "Reasoning: forcing GPU and PCIe Root Port onto one identical core can increase IRQ contention.",
-            "Using adjacent physical cores in the same locality usually balances cache/topology proximity and contention.",
+            f"Reasoning: {rec.get('reason', 'Topology-aware branch policy applied.')}",
+            "forcing GPU and PCIe Root Port onto one identical core can increase IRQ contention.",
         ]
         return "\n".join(lines)
 
