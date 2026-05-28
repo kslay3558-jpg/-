@@ -98,11 +98,11 @@ class IRQOptimizerApp:
         self.backup_file = os.path.join(backup_dir, "irq_backup.json")
 
         self.cpu_info = self.get_cpu_info()
-        self.physical_cores, self.logical_processors = self.get_core_counts()
-        self.original_logical_processors = self.logical_processors
-        self.logical_processors = max(1, min(self.logical_processors, self.MAX_GROUP_CORES))
+        self.physical_cores, detected_logical_processors = self.get_core_counts()
+        self.original_logical_processors = detected_logical_processors
+        self.is_smt_enabled = self.original_logical_processors > self.physical_cores
+        self.logical_processors = max(1, min(detected_logical_processors, self.MAX_GROUP_CORES))
         self.group_limit_active = self.original_logical_processors > self.MAX_GROUP_CORES
-        self.is_smt_enabled = self.logical_processors > self.physical_cores
         self.cpu_arch = self.classify_cpu()
         self.locality_groups = self.build_locality_groups()
         self.topology_snapshot = self.get_topology_snapshot()
@@ -937,11 +937,11 @@ $numa = Get-CimInstance Win32_NumaNode | Select-Object NodeNumber,NumberOfLogica
         right = ctk.CTkFrame(toolbar, fg_color="transparent")
         right.pack(side=tk.RIGHT, fill=tk.Y, padx=8)
         ctk.CTkButton(
-            right, text="↩  Undo Last",     command=self.undo_last_change,
+            right, text="↩  Undo Focused",     command=self.undo_last_change,
             width=118, fg_color=("#64748b", "#475569"), hover_color=("#475569", "#334155"), **_BTN,
         ).pack(side=tk.LEFT, padx=3, pady=11)
         ctk.CTkButton(
-            right, text="🗑  Factory Reset", command=self.factory_reset,
+            right, text="🗑  Reset Focused", command=self.factory_reset,
             width=130, fg_color=("#dc2626", "#ef4444"), hover_color=("#b91c1c", "#dc2626"), **_BTN,
         ).pack(side=tk.LEFT, padx=3, pady=11)
         ctk.CTkButton(
@@ -1252,7 +1252,7 @@ $output | Sort-Object Name | ConvertTo-Json -Depth 3
             "Confirm IRQ affinity change",
             "This will modify HKLM registry IRQ affinity settings for the selected device(s).\n\n"
             "Incorrect settings may cause USB/audio/network/storage/GPU instability until reverted.\n"
-            "Use Undo Last or Factory Reset if needed.\n\n"
+            "Use Undo Focused or Reset Focused if needed.\n\n"
             f"Selected device count: {len(selected_instances)}\n\n"
             "Continue?",
         ):
@@ -1263,24 +1263,36 @@ $output | Sort-Object Name | ConvertTo-Json -Depth 3
             cores = self.get_selected_cores()
             mask_int = self.mask_from_cores(cores)
             assignment_bytes = mask_int.to_bytes(8, "little")
+            succeeded = []
             for instance_id in selected_instances:
-                current_state = self.read_affinity_values(instance_id)
-                self.backup_current_state(instance_id, current_state, mask_int, cores)
-                self.write_affinity_values(instance_id, assignment_bytes, device_policy=4)
+                try:
+                    current_state = self.read_affinity_values(instance_id)
+                    self.backup_current_state(instance_id, current_state, mask_int, cores)
+                    self.write_affinity_values(instance_id, assignment_bytes, device_policy=4)
 
-                verify_state = self.read_affinity_values(instance_id)
-                verify_assignment = verify_state.get("assignment")
-                verify_policy = verify_state.get("device_policy")
-                if not isinstance(verify_assignment, (bytes, bytearray)):
-                    raise RuntimeError(
-                        f"Verification failed for {instance_id}: AssignmentSetOverride missing after write."
+                    verify_state = self.read_affinity_values(instance_id)
+                    verify_assignment = verify_state.get("assignment")
+                    verify_policy = verify_state.get("device_policy")
+                    if not isinstance(verify_assignment, (bytes, bytearray)):
+                        raise RuntimeError("AssignmentSetOverride missing after write.")
+                    if int.from_bytes(verify_assignment, "little") != mask_int:
+                        raise RuntimeError("Written IRQ mask does not match.")
+                    if int(verify_policy) != 4:
+                        raise RuntimeError("DevicePolicy is not 4.")
+                    succeeded.append(instance_id)
+                except Exception as exc:
+                    applied_count = len(succeeded)
+                    total_count = len(selected_instances)
+                    self.status_var.set(
+                        f"Apply partially failed ({applied_count}/{total_count}) at device {instance_id}"
                     )
-                if int.from_bytes(verify_assignment, "little") != mask_int:
-                    raise RuntimeError(
-                        f"Verification failed for {instance_id}: written IRQ mask does not match."
+                    messagebox.showerror(
+                        "Apply partially failed" if applied_count else "Apply failed",
+                        f"Applied: {applied_count} / {total_count} device(s)\n"
+                        f"Failed at: {instance_id}\n"
+                        f"Reason: {exc}",
                     )
-                if int(verify_policy) != 4:
-                    raise RuntimeError(f"Verification failed for {instance_id}: DevicePolicy is not 4.")
+                    return
 
             if self.current_instance_id and self.current_instance_id in selected_instances:
                 self.update_core_display_for_device(self.current_instance_id)
@@ -1304,7 +1316,7 @@ $output | Sort-Object Name | ConvertTo-Json -Depth 3
 
         if not messagebox.askyesno(
             "Confirm factory reset",
-            "This will remove custom IRQ affinity values for the selected device. Continue?",
+            "This will remove custom IRQ affinity values for the focused/current device only. Continue?",
         ):
             return
 
@@ -1329,10 +1341,10 @@ $output | Sort-Object Name | ConvertTo-Json -Depth 3
                 raise RuntimeError("Factory reset verification failed: DevicePolicy still exists.")
 
             self.update_core_display_for_device(self.current_instance_id)
-            self.status_var.set("Factory reset completed for selected device")
+            self.status_var.set("Reset completed for focused/current device")
             messagebox.showinfo(
-                "Factory reset",
-                "Custom IRQ affinity was removed for the selected device.\n\n"
+                "Reset focused device",
+                "Custom IRQ affinity was removed for the focused/current device.\n\n"
                 "⚠️ 변경 사항을 실제로 적용하려면 시스템을 재부팅하세요.",
             )
         except Exception as exc:
@@ -1348,7 +1360,7 @@ $output | Sort-Object Name | ConvertTo-Json -Depth 3
         backup = self.load_backup()
         entry = backup.get("entries", {}).get(self.current_instance_id)
         if not isinstance(entry, dict):
-            messagebox.showwarning("Undo unavailable", "No backup found for selected device.")
+            messagebox.showwarning("Undo unavailable", "No backup found for focused/current device.")
             return
 
         self._start_busy()
@@ -1392,10 +1404,10 @@ $output | Sort-Object Name | ConvertTo-Json -Depth 3
                     raise RuntimeError("Undo verification failed: affinity key should not exist.")
 
             self.update_core_display_for_device(self.current_instance_id)
-            self.status_var.set("Undo completed for selected device")
+            self.status_var.set("Undo completed for focused/current device")
             messagebox.showinfo(
-                "Undo",
-                "Previous state was restored successfully.\n\n"
+                "Undo focused device",
+                "Previous state was restored successfully for the focused/current device.\n\n"
                 "⚠️ 변경 사항을 실제로 적용하려면 시스템을 재부팅하세요.",
             )
         except Exception as exc:
