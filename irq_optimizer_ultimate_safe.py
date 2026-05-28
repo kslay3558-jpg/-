@@ -1063,7 +1063,7 @@ $numa = Get-CimInstance Win32_NumaNode | Select-Object NodeNumber,NumberOfLogica
                 height=52,
                 corner_radius=6,
                 border_width=2,
-                border_color="transparent",
+                border_color=_TILE_NORMAL,
                 fg_color=_TILE_NORMAL,
                 hover_color=_TILE_HOVER,
                 command=lambda idx=i: self._toggle_core(idx),
@@ -1089,7 +1089,7 @@ $numa = Get-CimInstance Win32_NumaNode | Select-Object NodeNumber,NumberOfLogica
         if is_recommended:
             btn.configure(border_color=_RECOMMEND_BORDER, border_width=2)
         else:
-            btn.configure(border_color="transparent", border_width=2)
+            btn.configure(border_color=_TILE_NORMAL, border_width=0)
 
     def highlight_recommendations(self):
         for i in range(len(self._core_tiles)):
