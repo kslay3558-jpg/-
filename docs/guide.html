@@ -1,0 +1,100 @@
+<!doctype html>
+<html lang="ko">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>IRQ Optimizer 사용 가이드</title>
+    <link rel="stylesheet" href="./style.css" />
+  </head>
+  <body>
+    <main class="wrap">
+      <section class="hero">
+        <h1>IRQ Optimizer 상세 사용 가이드</h1>
+        <p>
+          Windows 스케줄러의 추측 기반 분산 대신, 핵심 장치 IRQ를 직접 지정해 입력 지연과
+          프레임타임 흔들림을 완화하는 실전 절차입니다.
+        </p>
+      </section>
+
+      <section class="grid">
+        <article class="card">
+          <h2>1) 실행 준비</h2>
+          <ul>
+            <li>Windows 관리자 권한으로 실행합니다.</li>
+            <li><code>python irq_optimizer_ultimate_safe.py</code>로 시작합니다.</li>
+            <li>권한이 낮으면 UAC 재실행이 자동 시도됩니다.</li>
+          </ul>
+        </article>
+
+        <article class="card">
+          <h2>2) 장치 스캔</h2>
+          <ul>
+            <li><b>Refresh Devices</b> 클릭</li>
+            <li>역할 태그(GPU/GPU-ROOT/AUDIO/STORAGE/NIC) 확인</li>
+            <li><b>Select Target Devices</b>로 권장 대상 자동 선택</li>
+          </ul>
+        </article>
+
+        <article class="card">
+          <h2>3) 코어 지정</h2>
+          <ul>
+            <li><b>Use Recommended</b>로 권장 코어 자동 선택</li>
+            <li>필요하면 체크박스로 수동 조정</li>
+            <li>장치별 현재 마스크가 있으면 선택 시 표시됩니다.</li>
+          </ul>
+        </article>
+
+        <article class="card">
+          <h2>4) 적용 및 재부팅</h2>
+          <ul>
+            <li><b>Apply</b>로 레지스트리에 마스크 기록</li>
+            <li>적용 전 상태는 자동 백업됩니다.</li>
+            <li>쓰기 후 즉시 검증되어 실패 시 에러를 표시합니다.</li>
+            <li><span class="pill warn">중요</span><b>Apply 후 반드시 시스템을 재부팅해야 변경이 실제로 적용됩니다.</b></li>
+          </ul>
+        </article>
+
+        <article class="card">
+          <h2>5) 복구</h2>
+          <ul>
+            <li><b>Undo Focused</b>: 현재 포커스 장치의 마지막 변경 되돌리기</li>
+            <li><b>Reset Focused</b>: 현재 포커스 장치의 커스텀 IRQ 값 제거</li>
+            <li>백업 파일: <code>C:\ProgramData\IRQOptimizer\irq_backup.json</code></li>
+            <li><span class="pill warn">중요</span>복구 후에도 재부팅해야 실제로 적용됩니다.</li>
+          </ul>
+        </article>
+
+        <article class="card">
+          <h2>토폴로지 기반 추천 엔진</h2>
+          <ul>
+            <li>앱 실행 시 CPU 아키텍처를 자동 분류합니다.</li>
+            <li>
+              분기(Branch) 종류:
+              <ul>
+                <li><b>intel_hybrid</b> – P-코어 클러스터에 GPU/Root Port 배치, E-코어에 사이드 장치</li>
+                <li><b>intel_legacy</b> – 균일 물리 코어에 고르게 분산</li>
+                <li><b>amd_dual_x3d</b> – 1차 CCD에 GPU, 2차 CCD에 사이드 장치</li>
+                <li><b>amd_single_x3d / amd_generic</b> – X3D 캐시 인접성을 유지하며 분산</li>
+              </ul>
+            </li>
+            <li><span class="pill warn">주의</span>추천값은 참고용입니다. BIOS 토폴로지 확인 후 수동 조정을 권장합니다.</li>
+          </ul>
+        </article>
+
+        <article class="card">
+          <h2>운영 권장</h2>
+          <ul>
+            <li><span class="pill ok">권장</span>GPU/오디오부터 순차 적용</li>
+            <li><span class="pill ok">권장</span>적용 후 프레임타임/입력지연 비교</li>
+            <li><span class="pill warn">주의</span>시스템별 편차가 존재</li>
+          </ul>
+        </article>
+      </section>
+
+      <p class="footer">
+        참고: GitHub README에는 커스텀 CSS 제약이 있으므로, 스타일 문서는 별도 HTML/CSS로
+        제공하는 방식이 가장 안정적입니다.
+      </p>
+    </main>
+  </body>
+</html>
