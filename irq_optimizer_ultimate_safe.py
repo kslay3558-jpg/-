@@ -292,13 +292,21 @@ $numa = Get-CimInstance Win32_NumaNode | Select-Object NodeNumber,NumberOfLogica
             if not side_cores:
                 side_cores = primary_locality[::2][:3]
             reason = "AMD branch: GPU proximity is maintained while side devices are split to reduce IRQ contention."
+        elif branch == "intel_legacy":
+            gpu_cores = primary_locality[: min(4, len(primary_locality))]
+            gpu_root_cores = primary_locality[1:3] or gpu_cores[:1]
+            step = 2 if self.is_smt_enabled and phys_limit >= 4 else 1
+            side_cores = [x for x in range(0, phys_limit, step) if x not in gpu_cores][:3]
+            if not side_cores:
+                side_cores = gpu_root_cores[:]
+            reason = "Intel legacy branch: spread across uniform physical cores; GPU on primary locality, side devices on non-overlapping physical cores."
         else:
             gpu_cores = primary_locality[: min(4, len(primary_locality))]
             gpu_root_cores = primary_locality[1:3] or gpu_cores[:1]
             side_cores = [x for x in physical_cores if x not in gpu_cores][:3]
             if not side_cores:
                 side_cores = gpu_root_cores[:]
-            reason = "Unknown CPU branch: locality-first conservative placement."
+            reason = "Unknown CPU: locality-first conservative placement."
 
         def _sanitize(values, fallback):
             clean = []
@@ -344,10 +352,11 @@ $numa = Get-CimInstance Win32_NumaNode | Select-Object NodeNumber,NumberOfLogica
         )
         msg = {
             "intel_hybrid": "Recommended cores focus on likely P-cores (typically lower index cores).",
-            "intel_legacy": "Recommended cores spread across physical cores.",
+            "intel_legacy": "Recommended cores spread evenly across uniform physical cores.",
             "amd_dual_x3d": "Recommended cores bias first CCD range (verify with your BIOS topology).",
-            "amd_single_x3d": "Recommended cores spread across available cores.",
+            "amd_single_x3d": "Recommended cores spread across available cores with X3D cache proximity.",
             "amd_generic": "Recommended cores spread across physical cores.",
+            "single_core_fallback": "Single logical processor: CPU 0 is used for all targets.",
             "unknown": "Default conservative spread recommendation is used.",
         }
         return guide + msg.get(self.cpu_arch, msg["unknown"])
@@ -597,8 +606,8 @@ $numa = Get-CimInstance Win32_NumaNode | Select-Object NodeNumber,NumberOfLogica
             f"- USB Controller: prefer low-contention nearby side core(s) {side_group}",
             f"- Audio/Storage/NIC: place on nearby but separate side cores when possible {side_group}",
             "",
-            f"Reasoning: {rec.get('reason', 'Topology-aware branch policy applied.')}",
-            "forcing GPU and PCIe Root Port onto one identical core can increase IRQ contention.",
+            f"Reasoning: {rec.get('reason', 'Topology-aware branch policy applied.')} "
+            "Forcing GPU and PCIe Root Port onto one identical core can increase IRQ contention.",
         ]
         return "\n".join(lines)
 

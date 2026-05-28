@@ -63,6 +63,23 @@
         </article>
 
         <article class="card">
+          <h2>토폴로지 기반 추천 엔진</h2>
+          <ul>
+            <li>앱 실행 시 CPU 아키텍처를 자동 분류합니다.</li>
+            <li>
+              분기(Branch) 종류:
+              <ul>
+                <li><b>intel_hybrid</b> – P-코어 클러스터에 GPU/Root Port 배치, E-코어에 사이드 장치</li>
+                <li><b>intel_legacy</b> – 균일 물리 코어에 고르게 분산</li>
+                <li><b>amd_dual_x3d</b> – 1차 CCD에 GPU, 2차 CCD에 사이드 장치</li>
+                <li><b>amd_single_x3d / amd_generic</b> – X3D 캐시 인접성을 유지하며 분산</li>
+              </ul>
+            </li>
+            <li><span class="pill warn">주의</span>추천값은 참고용입니다. BIOS 토폴로지 확인 후 수동 조정을 권장합니다.</li>
+          </ul>
+        </article>
+
+        <article class="card">
           <h2>운영 권장</h2>
           <ul>
             <li><span class="pill ok">권장</span>GPU/오디오부터 순차 적용</li>

@@ -90,6 +90,21 @@ python irq_optimizer_ultimate_safe.py
 C:\ProgramData\IRQOptimizer\irq_backup.json
 ```
 
+## 토폴로지 기반 추천 엔진
+
+앱 시작 시 CPU 아키텍처를 자동 분류하고, 각 장치 역할에 적합한 코어 그룹을 선정합니다.
+
+| 브랜치 | 적용 CPU | 배치 전략 |
+|---|---|---|
+| `intel_hybrid` | 12세대 이상 Core, Core Ultra | GPU·Root Port → P-코어 클러스터, 사이드 장치 → E-코어 |
+| `intel_legacy` | 11세대 이하 Core | GPU → 하위 물리 코어, 사이드 장치 → 균일 분산 |
+| `amd_dual_x3d` | Ryzen 7950X3D/9950X3D 등 | GPU → 1차 CCD, 사이드 장치 → 2차 CCD |
+| `amd_single_x3d` | Ryzen 5800X3D/7800X3D 등 | GPU → X3D 캐시 인접 코어, 사이드 장치 → 나머지 코어 |
+| `amd_generic` | 그 외 Ryzen/Threadripper | GPU → 하위 물리 코어, 사이드 장치 → 분리 배치 |
+
+> **주의:** 추천값은 BIOS/드라이버 레벨 토폴로지를 완전히 반영하지 못할 수 있습니다.  
+> 적용 후 반드시 실 체감 비교 및 필요 시 수동 조정을 권장합니다.
+
 ## 권장 운영 팁
 
 - 한 번에 모든 장치를 건드리지 말고, 핵심 장치부터 순차 적용
