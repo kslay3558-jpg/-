@@ -212,17 +212,17 @@ class IRQOptimizerApp:
             "Balanced": {
                 "role_order": ["gpu", "audio", "nic"],
                 "target_roles": {"gpu", "audio", "nic"},
-                "description": "General gaming baseline focused on GPU, audio, and network adapters.",
+                "description": "GPU·오디오·네트워크 장치를 중심으로 한 기본 게임 환경 권장값입니다.",
             },
             "Low Latency": {
                 "role_order": ["gpu", "nic", "audio"],
                 "target_roles": {"gpu", "audio", "nic"},
-                "description": "Prioritize input/network responsiveness with GPU, NIC, and audio only.",
+                "description": "입력/네트워크 반응성을 우선해 GPU·NIC·오디오만 집중 배치합니다.",
             },
             "Streaming": {
                 "role_order": ["gpu", "audio", "nic"],
                 "target_roles": {"gpu", "audio", "nic"},
-                "description": "Prioritize stream consistency for GPU, audio, and network devices.",
+                "description": "방송/녹화 중 안정성을 위해 GPU·오디오·네트워크 장치 균형을 우선합니다.",
             },
         }
 
@@ -408,7 +408,7 @@ class IRQOptimizerApp:
                 "gpu_cores": [0],
                 "gpu_root_cores": [0],
                 "side_cores": [0],
-                "reason": "Single logical processor detected; use CPU 0 for all targets.",
+                "reason": "논리 프로세서가 1개라서 모든 대상에 CPU 0을 사용합니다.",
             }
 
         topo = self.topology_snapshot or {}
@@ -439,7 +439,7 @@ class IRQOptimizerApp:
         gpu_root_cores = []
         side_cores = []
         branch = self.cpu_arch
-        reason = "Fallback conservative placement was applied."
+        reason = "기본 보수 배치 규칙이 적용되었습니다."
 
         def _tail_biased(values, limit, tail_ratio=0.5):
             ordered = []
@@ -481,14 +481,14 @@ class IRQOptimizerApp:
                 or _tail_biased(e_cores, 3, tail_ratio=0.5)
                 or _tail_biased([x for x in p_cores if x not in gpu_cores], 3, tail_ratio=0.5)
             )
-            reason = "Intel hybrid branch: P-core-aware placement with a mild tail bias to avoid concentrating on only the earliest P-cores."
+            reason = "Intel 하이브리드 분기: 초반 P코어 과집중을 피하도록 후반 코어를 약하게 우선하는 P코어 인식 배치를 적용했습니다."
         elif branch == "amd_dual_x3d":
             ccd0 = primary_locality or rep_lps[: max(1, len(rep_lps) // 2)]
             ccd1 = secondary_locality or [x for x in rep_lps if x not in ccd0]
             gpu_cores = _tail_biased(ccd0, min(6, len(ccd0)), tail_ratio=0.5)
             gpu_root_cores = _tail_biased([x for x in ccd0 if x not in gpu_cores], 2, tail_ratio=0.5) or gpu_cores[:1]
             side_cores = _tail_biased(ccd1, 3, tail_ratio=0.5) or _tail_biased([x for x in ccd0 if x not in gpu_cores], 3, tail_ratio=0.5)
-            reason = "AMD dual-CCD/X3D branch: locality-first split with a mild CCD0 tail bias for GPU-related cores."
+            reason = "AMD 듀얼 CCD/X3D 분기: 로컬리티 우선 분할과 GPU 관련 코어의 CCD0 후반 코어 약우선 규칙을 적용했습니다."
         elif branch in {"amd_single_x3d", "amd_generic"}:
             gpu_span = 6 if branch == "amd_single_x3d" else 4
             gpu_cores = _tail_biased(primary_locality, min(gpu_span, len(primary_locality)), tail_ratio=0.5)
@@ -496,21 +496,21 @@ class IRQOptimizerApp:
             side_cores = _tail_biased([x for x in rep_lps if x not in gpu_cores], 3, tail_ratio=0.5)
             if not side_cores:
                 side_cores = _tail_biased(primary_locality[::2], 3, tail_ratio=0.5)
-            reason = "AMD branch: GPU proximity is maintained while reducing front-core concentration with a mild tail bias."
+            reason = "AMD 분기: GPU 근접성을 유지하면서 초반 코어 과집중을 줄이도록 후반 코어 약우선 규칙을 적용했습니다."
         elif branch == "intel_legacy":
             gpu_cores = _tail_biased(primary_locality, min(4, len(primary_locality)), tail_ratio=0.5)
             gpu_root_cores = _tail_biased([x for x in primary_locality if x not in gpu_cores], 2, tail_ratio=0.5) or gpu_cores[:1]
             side_cores = _tail_biased([x for x in rep_lps if x not in gpu_cores], 3, tail_ratio=0.5)
             if not side_cores:
                 side_cores = gpu_root_cores[:]
-            reason = "Intel legacy branch: spread across uniform physical cores with a mild tail bias in primary locality."
+            reason = "Intel 레거시 분기: 주 로컬리티의 균일 물리 코어에 후반 코어 약우선 규칙으로 분산 배치했습니다."
         else:
             gpu_cores = _tail_biased(primary_locality, min(4, len(primary_locality)), tail_ratio=0.5)
             gpu_root_cores = _tail_biased([x for x in primary_locality if x not in gpu_cores], 2, tail_ratio=0.5) or gpu_cores[:1]
             side_cores = _tail_biased([x for x in rep_lps if x not in gpu_cores], 3, tail_ratio=0.5)
             if not side_cores:
                 side_cores = gpu_root_cores[:]
-            reason = "Unknown CPU: locality-first conservative placement with a mild tail bias."
+            reason = "미확인 CPU: 로컬리티 우선의 보수적 배치와 후반 코어 약우선 규칙을 적용했습니다."
 
         def _sanitize(values, fallback):
             clean = []
@@ -804,39 +804,46 @@ class IRQOptimizerApp:
 
         labels = {
             "gpu": "GPU",
-            "gpu_root_port": "GPU Root Port",
-            "usb_controller": "USB Controller",
-            "audio": "Audio",
-            "storage": "Storage",
+            "gpu_root_port": "GPU 루트 포트",
+            "usb_controller": "USB 컨트롤러",
+            "audio": "오디오",
+            "storage": "스토리지",
             "nic": "NIC",
         }
+        profile_labels = {
+            "Balanced": "균형형",
+            "Low Latency": "저지연",
+            "Streaming": "스트리밍",
+        }
+        active_profile = self.get_active_profile_name()
+        active_profile_ko = profile_labels.get(active_profile, active_profile)
         summary = ", ".join(f"{labels.get(role, role)}: {len(role_groups.get(role, []))}" for role in role_order)
         priority_text = " → ".join(labels.get(role, role) for role in role_order)
         profile = self.get_active_profile()
 
         lines = [
-            f"Target device recommendation profile: {self.get_active_profile_name()}",
-            f"Profile note: {profile.get('description', '')}",
-            f"Target priority: {priority_text}",
-            f"Detected devices: {summary}",
-            f"Topology summary: Source {topo.get('topology_source', 'Fallback heuristic')}, "
-            f"Groups {topo.get('summary', {}).get('group_count', 1)}, "
-            f"NUMA nodes {topo.get('numa_node_count', 1)}, "
-            f"Primary locality {topo.get('primary_group', [])}",
-            f"Branch policy: {rec.get('branch', self.cpu_arch)}",
+            f"대상 장치 추천 프로필: {active_profile_ko} ({active_profile})",
+            f"프로필 설명: {profile.get('description', '')}",
+            f"대상 우선순위: {priority_text}",
+            f"감지된 장치 수: {summary}",
+            f"토폴로지 요약: 소스 {topo.get('topology_source', '휴리스틱 추정')}, "
+            f"그룹 {topo.get('summary', {}).get('group_count', 1)}, "
+            f"NUMA 노드 {topo.get('numa_node_count', 1)}, "
+            f"주 로컬리티 {topo.get('primary_group', [])}",
+            f"분기 정책: {rec.get('branch', self.cpu_arch)}",
             "",
-            "Core placement policy:",
-            f"- GPU: use primary nearby physical-core group {gpu_group}",
-            f"- GPU Root Port: prefer adjacent same-locality cores {root_group} (avoid forced single-core overlap)",
-            f"- USB Controller: prefer low-contention nearby side core(s) {side_group}",
-            f"- Audio/Storage/NIC: place on nearby but separate side cores when possible {side_group}",
+            "코어 배치 정책:",
+            f"- GPU: 1차 근접 물리 코어 그룹 {gpu_group} 우선",
+            f"- GPU 루트 포트: 동일 로컬리티 인접 코어 {root_group} 우선 (강제 단일 코어 중첩 회피)",
+            f"- USB 컨트롤러: 경합이 낮은 인접 사이드 코어 {side_group} 우선",
+            f"- 오디오/스토리지/NIC: 가능하면 분리된 인접 사이드 코어 {side_group} 사용",
             "",
-            f"Reasoning: {rec.get('reason', 'Topology-aware heuristic applied.')} "
-            "Forcing GPU and PCIe Root Port onto one identical core can increase IRQ contention.",
+            f"근거: {rec.get('reason', '토폴로지 인식 휴리스틱 적용')} "
+            "GPU와 PCIe 루트 포트를 동일 코어에 강제로 겹치면 IRQ 경합이 증가할 수 있습니다.",
         ]
         if self.group_limit_active:
             lines.append(
-                "Warning: Only processor group 0 is supported. Logical processors above 63 are hidden."
+                "주의: Processor Group 0만 지원하며, 63번 초과 논리 프로세서는 숨겨집니다."
             )
         return "\n".join(lines)
 
@@ -992,7 +999,7 @@ class IRQOptimizerApp:
             self.sidebar, height=240, font=ctk.CTkFont("Consolas", 10), wrap="word"
         )
         self.recommend_text.pack(fill=tk.X, padx=8, pady=(0, 14))
-        self.recommend_text.insert("1.0", "Recommendation will be generated after device scan.")
+        self.recommend_text.insert("1.0", "장치 스캔 후 추천 전략이 여기에 표시됩니다.")
         self.recommend_text.configure(state="disabled")
 
     def _toggle_topology(self):
