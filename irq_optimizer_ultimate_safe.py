@@ -876,7 +876,11 @@ $output | Sort-Object Name | ConvertTo-Json -Depth 3
 
             self.update_core_display_for_device(self.current_instance_id)
             self.status_var.set(f"Applied IRQ mask {hex(mask_int)} to selected device")
-            messagebox.showinfo("Success", f"IRQ affinity applied. Mask: {hex(mask_int)}")
+            messagebox.showinfo(
+                "Success",
+                f"IRQ affinity applied. Mask: {hex(mask_int)}\n\n"
+                "⚠️ 변경 사항을 실제로 적용하려면 시스템을 재부팅하세요.",
+            )
         except Exception as exc:
             messagebox.showerror("Apply failed", str(exc))
 
@@ -910,7 +914,11 @@ $output | Sort-Object Name | ConvertTo-Json -Depth 3
 
             self.update_core_display_for_device(self.current_instance_id)
             self.status_var.set("Factory reset completed for selected device")
-            messagebox.showinfo("Factory reset", "Custom IRQ affinity was removed for the selected device.")
+            messagebox.showinfo(
+                "Factory reset",
+                "Custom IRQ affinity was removed for the selected device.\n\n"
+                "⚠️ 변경 사항을 실제로 적용하려면 시스템을 재부팅하세요.",
+            )
         except Exception as exc:
             messagebox.showerror("Factory reset failed", str(exc))
 
@@ -967,7 +975,11 @@ $output | Sort-Object Name | ConvertTo-Json -Depth 3
 
             self.update_core_display_for_device(self.current_instance_id)
             self.status_var.set("Undo completed for selected device")
-            messagebox.showinfo("Undo", "Previous state was restored successfully.")
+            messagebox.showinfo(
+                "Undo",
+                "Previous state was restored successfully.\n\n"
+                "⚠️ 변경 사항을 실제로 적용하려면 시스템을 재부팅하세요.",
+            )
         except Exception as exc:
             messagebox.showerror("Undo failed", str(exc))
 
