@@ -14,6 +14,7 @@ import tkinter as tk
 from tkinter import messagebox, ttk
 
 import customtkinter as ctk
+from windows_topology import WindowsTopologyReader
 
 try:
     import winreg
@@ -98,6 +99,7 @@ class IRQOptimizerApp:
         self.backup_file = os.path.join(backup_dir, "irq_backup.json")
 
         self.cpu_info = self.get_cpu_info()
+        self.topology_snapshot = self.get_topology_snapshot()
         self.physical_cores, detected_logical_processors = self.get_core_counts()
         self.original_logical_processors = detected_logical_processors
         self.is_smt_enabled = self.original_logical_processors > self.physical_cores
@@ -105,7 +107,6 @@ class IRQOptimizerApp:
         self.group_limit_active = self.original_logical_processors > self.MAX_GROUP_CORES
         self.cpu_arch = self.classify_cpu()
         self.locality_groups = self.build_locality_groups()
-        self.topology_snapshot = self.get_topology_snapshot()
         self.recommendation_sets = self.derive_topology_recommendation()
 
         self.create_widgets()
@@ -153,6 +154,22 @@ class IRQOptimizerApp:
         return "Unknown CPU"
 
     def get_core_counts(self):
+        topo = self.topology_snapshot or {}
+        summary = topo.get("summary", {}) if isinstance(topo, dict) else {}
+        if topo.get("api_available"):
+            physical = int(
+                summary.get("physical_core_count_group0")
+                or summary.get("physical_core_count")
+                or 0
+            )
+            logical_total = int(
+                summary.get("logical_processor_count")
+                or summary.get("logical_processor_count_group0")
+                or 0
+            )
+            if physical > 0 and logical_total > 0:
+                return physical, logical_total
+
         try:
             result = self._run_powershell(
                 "Get-CimInstance Win32_Processor | "
@@ -229,76 +246,154 @@ class IRQOptimizerApp:
         self.status_var.set(f"Preference profile set to {self.get_active_profile_name()}")
 
     def build_locality_groups(self):
-        total = self.logical_processors
+        topo = self.topology_snapshot or {}
+        if topo.get("api_available"):
+            groups = []
+            for grp in topo.get("locality_groups", []):
+                norm = [
+                    int(x) for x in grp
+                    if isinstance(x, int) and 0 <= int(x) < self.MAX_GROUP_CORES
+                ]
+                if norm:
+                    groups.append(norm)
+            if groups:
+                return groups
+
+        total = max(1, min(self.logical_processors, self.MAX_GROUP_CORES))
         if total <= 1:
             return [[0]]
-
         phys_limit = min(max(1, self.physical_cores), total)
         physical_cores = list(range(phys_limit))
 
         if self.cpu_arch == "amd_dual_x3d" and phys_limit >= 8:
             split = max(1, phys_limit // 2)
-            groups = [physical_cores[:split], physical_cores[split:]]
-            return [g for g in groups if g]
-
+            return [physical_cores[:split], physical_cores[split:]]
         if self.cpu_arch == "intel_hybrid" and phys_limit >= 6:
             p_core_guess = max(2, phys_limit // 2)
-            groups = [physical_cores[:p_core_guess], physical_cores[p_core_guess:]]
-            return [g for g in groups if g]
-
+            return [physical_cores[:p_core_guess], physical_cores[p_core_guess:]]
         return [physical_cores]
 
     def get_topology_snapshot(self):
+        logical_guess = max(1, os.cpu_count() or 1)
         fallback = {
+            "api_available": False,
+            "topology_source": "Fallback heuristic",
+            "source": "fallback heuristic",
+            "groups": [
+                {
+                    "group_id": 0,
+                    "maximum_processor_count": 64,
+                    "active_processor_count": min(logical_guess, self.MAX_GROUP_CORES),
+                    "active_mask": (1 << min(logical_guess, self.MAX_GROUP_CORES)) - 1,
+                }
+            ],
+            "cores": [],
+            "numa_nodes": [],
+            "summary": {
+                "group_count": 1,
+                "physical_core_count": 0,
+                "physical_core_count_group0": 0,
+                "logical_processor_count": logical_guess,
+                "logical_processor_count_group0": min(logical_guess, self.MAX_GROUP_CORES),
+                "numa_node_count": 1,
+                "efficiency_classes": [],
+                "smt_widths": [],
+            },
             "socket_count": 1,
             "numa_node_count": 1,
-            "numa_logical_processors": [self.logical_processors],
-            "locality_groups": [list(g) for g in self.locality_groups],
-            "primary_group": list(self.locality_groups[0]) if self.locality_groups else [0],
-            "secondary_group": list(self.locality_groups[1][:2]) if len(self.locality_groups) > 1 else [],
+            "numa_logical_processors": [min(logical_guess, self.MAX_GROUP_CORES)],
+            "locality_groups": [list(range(min(max(1, logical_guess // 2), self.MAX_GROUP_CORES)))],
+            "primary_group": [0],
+            "secondary_group": [1] if logical_guess > 1 else [],
+            "group0_representative_logical_processors": list(range(min(logical_guess, self.MAX_GROUP_CORES))),
+            "group0_efficiency_by_logical_processor": {},
             "performance_core_count": 0,
             "efficiency_core_count": 0,
+            "error": None,
         }
         try:
-            script = r"""
-$processors = Get-CimInstance Win32_Processor | Select-Object Name,Manufacturer,NumberOfCores,NumberOfLogicalProcessors,NumberOfPerformanceCores,NumberOfEfficiencyCores
-$numa = Get-CimInstance Win32_NumaNode | Select-Object NodeNumber,NumberOfLogicalProcessors
-[PSCustomObject]@{
-  Processors = $processors
-  NumaNodes = $numa
-} | ConvertTo-Json -Depth 5
-""".strip()
-            result = self._run_powershell(script)
-            if result.returncode != 0 or not result.stdout.strip():
+            reader = WindowsTopologyReader()
+            api_snapshot = reader.read_snapshot()
+            if not api_snapshot.get("api_available"):
                 return fallback
 
-            data = json.loads(result.stdout.strip())
-            procs = data.get("Processors") if isinstance(data, dict) else None
-            numa = data.get("NumaNodes") if isinstance(data, dict) else None
+            summary = api_snapshot.get("summary", {})
+            rep_lps = [
+                int(x) for x in api_snapshot.get("group0_representative_logical_processors", [])
+                if isinstance(x, int) and 0 <= int(x) < self.MAX_GROUP_CORES
+            ]
+            if not rep_lps:
+                return fallback
 
-            if isinstance(procs, dict):
-                procs = [procs]
-            if isinstance(numa, dict):
-                numa = [numa]
+            core_by_rep = {}
+            for core in api_snapshot.get("cores", []):
+                rep = WindowsTopologyReader.select_representative_group0_lp(core)
+                if rep is None or rep >= self.MAX_GROUP_CORES:
+                    continue
+                lps = WindowsTopologyReader.filter_group0_logical_processors(core.get("logical_processors", []))
+                core_by_rep[rep] = {
+                    "logical_processors": lps,
+                    "smt_width": max(1, len(lps)),
+                    "efficiency_class": core.get("efficiency_class"),
+                }
 
-            socket_count = len(procs) if isinstance(procs, list) and procs else 1
-            numa_nodes = (
-                [int(x.get("NumberOfLogicalProcessors", 0) or 0) for x in numa]
-                if isinstance(numa, list)
-                else []
+            numa_groups = []
+            for node in api_snapshot.get("numa_nodes", []):
+                node_lps = set(WindowsTopologyReader.filter_group0_logical_processors(node.get("logical_processors", [])))
+                reps = [rep for rep in rep_lps if rep in node_lps]
+                if reps:
+                    numa_groups.append(sorted(set(reps)))
+            if not numa_groups:
+                numa_groups = [rep_lps]
+
+            eff_map = {}
+            for cls, reps in (api_snapshot.get("efficiency_class_map_group0", {}) or {}).items():
+                key = int(cls)
+                norm = sorted(set(int(x) for x in reps if isinstance(x, int) and 0 <= int(x) < self.MAX_GROUP_CORES))
+                if norm:
+                    eff_map[key] = norm
+
+            perf_count = 0
+            eff_count = 0
+            if eff_map:
+                perf_class = min(eff_map.keys())
+                perf_count = len(eff_map.get(perf_class, []))
+                eff_count = max(0, len(rep_lps) - perf_count)
+
+            group0_active = int(
+                summary.get("logical_processor_count_group0")
+                or next((g.get("active_processor_count") for g in api_snapshot.get("groups", []) if g.get("group_id") == 0), 0)
+                or 0
             )
-            numa_nodes = [x for x in numa_nodes if x > 0]
-            numa_node_count = max(1, len(numa_nodes))
+            if group0_active <= 0:
+                group0_active = min(self.MAX_GROUP_CORES, max((max(rep_lps) + 1), len(rep_lps)))
 
-            snapshot = dict(fallback)
-            snapshot["socket_count"] = socket_count
-            snapshot["numa_node_count"] = numa_node_count
-            snapshot["numa_logical_processors"] = (
-                numa_nodes if numa_nodes else [self.logical_processors]
-            )
-            if isinstance(procs, list):
-                snapshot["performance_core_count"] = sum(int(x.get("NumberOfPerformanceCores", 0) or 0) for x in procs)
-                snapshot["efficiency_core_count"] = sum(int(x.get("NumberOfEfficiencyCores", 0) or 0) for x in procs)
+            snapshot = {
+                "api_available": True,
+                "topology_source": "Windows API",
+                "source": "Windows API-derived core relationships",
+                "groups": api_snapshot.get("groups", []),
+                "cores": api_snapshot.get("cores", []),
+                "numa_nodes": api_snapshot.get("numa_nodes", []),
+                "summary": summary,
+                "socket_count": 1,
+                "numa_node_count": max(1, int(summary.get("numa_node_count", len(numa_groups) or 1))),
+                "numa_logical_processors": [len(x) for x in numa_groups] or [len(rep_lps)],
+                "locality_groups": numa_groups,
+                "primary_group": list(numa_groups[0]) if numa_groups else [rep_lps[0]],
+                "secondary_group": list(numa_groups[1][:2]) if len(numa_groups) > 1 else [],
+                "group0_active_logical_processors": group0_active,
+                "group0_representative_logical_processors": rep_lps,
+                "group0_efficiency_by_logical_processor": {
+                    rep: core_by_rep.get(rep, {}).get("efficiency_class") for rep in rep_lps
+                },
+                "group0_core_map": core_by_rep,
+                "efficiency_classes": sorted(eff_map.keys()),
+                "efficiency_class_map_group0": eff_map,
+                "performance_core_count": perf_count,
+                "efficiency_core_count": eff_count,
+                "error": api_snapshot.get("error"),
+            }
             return snapshot
         except Exception:
             return fallback
@@ -315,21 +410,27 @@ $numa = Get-CimInstance Win32_NumaNode | Select-Object NodeNumber,NumberOfLogica
                 "reason": "Single logical processor detected; use CPU 0 for all targets.",
             }
 
-        phys_limit = min(max(1, self.physical_cores), total)
-        physical_cores = list(range(phys_limit))
         topo = self.topology_snapshot or {}
+        rep_lps = [
+            int(x)
+            for x in topo.get("group0_representative_logical_processors", [])
+            if isinstance(x, int) and 0 <= int(x) < total
+        ]
+        if not rep_lps:
+            phys_limit = min(max(1, self.physical_cores), total)
+            rep_lps = list(range(phys_limit))
 
         locality_groups = []
         for grp in topo.get("locality_groups", self.locality_groups):
-            norm = [x for x in grp if isinstance(x, int) and 0 <= x < phys_limit]
+            norm = [x for x in grp if isinstance(x, int) and 0 <= int(x) < total and x in rep_lps]
             if norm:
                 locality_groups.append(norm)
         if not locality_groups:
-            locality_groups = [physical_cores]
+            locality_groups = [rep_lps]
 
         primary_locality = locality_groups[0]
         secondary_locality = locality_groups[1] if len(locality_groups) > 1 else []
-        remaining = [x for x in physical_cores if x not in primary_locality]
+        remaining = [x for x in rep_lps if x not in primary_locality]
         if not secondary_locality:
             secondary_locality = remaining
 
@@ -340,53 +441,47 @@ $numa = Get-CimInstance Win32_NumaNode | Select-Object NodeNumber,NumberOfLogica
         reason = "Fallback conservative placement was applied."
 
         if branch == "intel_hybrid":
-            reported_p_cores = int(topo.get("performance_core_count", 0) or 0)
-            reported_e_cores = int(topo.get("efficiency_core_count", 0) or 0)
-            if reported_p_cores > 0:
-                p_core_count = max(1, min(phys_limit, reported_p_cores))
-            elif reported_e_cores > 0:
-                p_core_count = max(1, min(phys_limit, phys_limit - reported_e_cores))
+            eff_map = topo.get("efficiency_class_map_group0", {}) or {}
+            if eff_map:
+                perf_class = min(int(k) for k in eff_map.keys())
+                p_cores = [x for x in eff_map.get(perf_class, []) if x in rep_lps]
+                e_cores = [x for x in rep_lps if x not in p_cores]
             else:
-                p_core_count = max(2, min(phys_limit, (phys_limit * 2) // 3))
-            p_cores = physical_cores[:p_core_count]
-            e_cores = [x for x in physical_cores if x not in p_cores]
-            gpu_cores = p_cores[: min(6, len(p_cores))] or primary_locality[: min(4, len(primary_locality))]
+                p_core_count = max(2, min(len(rep_lps), (len(rep_lps) * 2) // 3))
+                p_cores = rep_lps[:p_core_count]
+                e_cores = [x for x in rep_lps if x not in p_cores]
+            p_primary = [x for x in primary_locality if x in p_cores]
+            e_secondary = [x for x in secondary_locality if x in e_cores]
+            gpu_cores = p_primary[: min(6, len(p_primary))] or p_cores[: min(4, len(p_cores))] or primary_locality[: min(4, len(primary_locality))]
             gpu_root_cores = p_cores[1:3] or gpu_cores[:1]
-            side_cores = e_cores[:3] or [x for x in p_cores if x not in gpu_cores][:3]
-            if reported_p_cores > 0 or reported_e_cores > 0:
-                reason = (
-                    "Intel hybrid branch: used OS-reported P/E core counts for primary placement; "
-                    "GPU favors P-core cluster, side devices prefer E-core/adjacent cores."
-                )
-            else:
-                reason = "Intel hybrid branch: GPU favors P-core cluster, side devices prefer E-core/adjacent cores."
+            side_cores = e_secondary[:3] or e_cores[:3] or [x for x in p_cores if x not in gpu_cores][:3]
+            reason = "Intel hybrid branch: efficiency-class-aware placement (P-like class first), while side devices prefer non-overlapping cores."
         elif branch == "amd_dual_x3d":
-            ccd0 = primary_locality or physical_cores[: max(1, phys_limit // 2)]
-            ccd1 = secondary_locality or [x for x in physical_cores if x not in ccd0]
+            ccd0 = primary_locality or rep_lps[: max(1, len(rep_lps) // 2)]
+            ccd1 = secondary_locality or [x for x in rep_lps if x not in ccd0]
             gpu_cores = ccd0[: min(6, len(ccd0))]
             gpu_root_cores = ccd0[1:3] or gpu_cores[:1]
             side_cores = ccd1[:3] or [x for x in ccd0 if x not in gpu_cores][:3]
-            reason = "AMD dual-CCD/X3D branch: GPU and root port stay on primary CCD, side devices shift to secondary CCD."
+            reason = "AMD dual-CCD/X3D branch: NUMA/locality-first spread with conservative fallback heuristics."
         elif branch in {"amd_single_x3d", "amd_generic"}:
             gpu_span = 6 if branch == "amd_single_x3d" else 4
             gpu_cores = primary_locality[: min(gpu_span, len(primary_locality))]
             gpu_root_cores = primary_locality[1:3] or gpu_cores[:1]
-            side_cores = [x for x in physical_cores if x not in gpu_cores][:3]
+            side_cores = [x for x in rep_lps if x not in gpu_cores][:3]
             if not side_cores:
                 side_cores = primary_locality[::2][:3]
             reason = "AMD branch: GPU proximity is maintained while side devices are split to reduce IRQ contention."
         elif branch == "intel_legacy":
             gpu_cores = primary_locality[: min(4, len(primary_locality))]
             gpu_root_cores = primary_locality[1:3] or gpu_cores[:1]
-            step = 2 if self.is_smt_enabled and phys_limit >= 4 else 1
-            side_cores = [x for x in range(0, phys_limit, step) if x not in gpu_cores][:3]
+            side_cores = [x for x in rep_lps if x not in gpu_cores][:3]
             if not side_cores:
                 side_cores = gpu_root_cores[:]
             reason = "Intel legacy branch: spread across uniform physical cores; GPU on primary locality, side devices on non-overlapping physical cores."
         else:
             gpu_cores = primary_locality[: min(4, len(primary_locality))]
             gpu_root_cores = primary_locality[1:3] or gpu_cores[:1]
-            side_cores = [x for x in physical_cores if x not in gpu_cores][:3]
+            side_cores = [x for x in rep_lps if x not in gpu_cores][:3]
             if not side_cores:
                 side_cores = gpu_root_cores[:]
             reason = "Unknown CPU: locality-first conservative placement."
@@ -408,8 +503,6 @@ $numa = Get-CimInstance Win32_NumaNode | Select-Object NodeNumber,NumberOfLogica
         for core in gpu_cores + side_cores:
             if core not in base_cores:
                 base_cores.append(core)
-        if self.is_smt_enabled and len(base_cores) >= 4:
-            base_cores = base_cores[::2] or [base_cores[0]]
 
         return {
             "branch": branch,
@@ -424,6 +517,14 @@ $numa = Get-CimInstance Win32_NumaNode | Select-Object NodeNumber,NumberOfLogica
         smt = "On" if self.is_smt_enabled else "Off"
         topo = self.topology_snapshot or {}
         rec = self.recommendation_sets or {}
+        summary = topo.get("summary", {}) if isinstance(topo, dict) else {}
+        groups = topo.get("groups", []) if isinstance(topo, dict) else []
+        group0 = next((g for g in groups if int(g.get("group_id", -1)) == 0), {})
+        smt_widths = summary.get("smt_widths", [])
+        smt_summary = ", ".join(str(x) for x in smt_widths) if smt_widths else ("2" if self.is_smt_enabled else "1")
+        eff_classes = topo.get("efficiency_classes") or summary.get("efficiency_classes", [])
+        eff_text = ", ".join(str(x) for x in eff_classes) if eff_classes else "Unavailable"
+        source = topo.get("topology_source", "Fallback heuristic")
         guide = (
             f"CPU: {self.cpu_info}\n"
             f"Cores: Physical {self.physical_cores} / Logical {self.logical_processors}"
@@ -431,21 +532,32 @@ $numa = Get-CimInstance Win32_NumaNode | Select-Object NodeNumber,NumberOfLogica
             f"SMT/HT: {smt}\n"
             f"Architecture profile: {self.cpu_arch}\n"
             f"Recommendation branch: {rec.get('branch', self.cpu_arch)}\n"
-            f"Sockets: {topo.get('socket_count', 1)}, NUMA nodes: {topo.get('numa_node_count', 1)}\n"
+            f"Topology source: {source}\n"
+            f"Processor groups: {summary.get('group_count', len(groups) or 1)}, "
+            f"Group 0 active LPs: {topo.get('group0_active_logical_processors', group0.get('active_processor_count', self.logical_processors))}\n"
+            f"Physical cores (topology): {summary.get('physical_core_count_group0', self.physical_cores)}, "
+            f"SMT width set: {smt_summary}\n"
+            f"Sockets: {topo.get('socket_count', 1)}, NUMA nodes: {topo.get('numa_node_count', summary.get('numa_node_count', 1))}\n"
             f"Reported P-cores: {topo.get('performance_core_count', 0)}, "
             f"E-cores: {topo.get('efficiency_core_count', 0)}\n"
+            f"Detected efficiency classes: {eff_text}\n"
             f"Locality groups: {topo.get('locality_groups', self.locality_groups)}\n\n"
         )
         msg = {
-            "intel_hybrid": "Recommended cores focus on likely P-cores (typically lower index cores).",
+            "intel_hybrid": "Topology-aware heuristic: efficiency classes and physical-core mapping are preferred.",
             "intel_legacy": "Recommended cores spread evenly across uniform physical cores.",
-            "amd_dual_x3d": "Recommended cores bias first CCD range (verify with your BIOS topology).",
+            "amd_dual_x3d": "Topology-aware heuristic: NUMA/locality split is preferred for side devices.",
             "amd_single_x3d": "Recommended cores spread across available cores with X3D cache proximity.",
             "amd_generic": "Recommended cores spread across physical cores.",
             "single_core_fallback": "Single logical processor: CPU 0 is used for all targets.",
             "unknown": "Default conservative spread recommendation is used.",
         }
-        return guide + msg.get(self.cpu_arch, msg["unknown"])
+        return (
+            guide
+            + msg.get(self.cpu_arch, msg["unknown"])
+            + "\nWindows API-derived core relationships are used when available.\n"
+            + "Not a guarantee of optimal IRQ placement."
+        )
 
     def get_reg_path(self, instance_id):
         return (
@@ -681,7 +793,9 @@ $numa = Get-CimInstance Win32_NumaNode | Select-Object NodeNumber,NumberOfLogica
             f"Profile note: {profile.get('description', '')}",
             f"Target priority: {priority_text}",
             f"Detected devices: {summary}",
-            f"Topology summary: Sockets {topo.get('socket_count', 1)}, NUMA nodes {topo.get('numa_node_count', 1)}, "
+            f"Topology summary: Source {topo.get('topology_source', 'Fallback heuristic')}, "
+            f"Groups {topo.get('summary', {}).get('group_count', 1)}, "
+            f"NUMA nodes {topo.get('numa_node_count', 1)}, "
             f"Primary locality {topo.get('primary_group', [])}",
             f"Branch policy: {rec.get('branch', self.cpu_arch)}",
             "",
@@ -691,7 +805,7 @@ $numa = Get-CimInstance Win32_NumaNode | Select-Object NodeNumber,NumberOfLogica
             f"- USB Controller: prefer low-contention nearby side core(s) {side_group}",
             f"- Audio/Storage/NIC: place on nearby but separate side cores when possible {side_group}",
             "",
-            f"Reasoning: {rec.get('reason', 'Topology-aware branch policy applied.')} "
+            f"Reasoning: {rec.get('reason', 'Topology-aware heuristic applied.')} "
             "Forcing GPU and PCIe Root Port onto one identical core can increase IRQ contention.",
         ]
         if self.group_limit_active:
@@ -1040,18 +1154,22 @@ $numa = Get-CimInstance Win32_NumaNode | Select-Object NodeNumber,NumberOfLogica
         self.core_vars.clear()
         self.checkbuttons.clear()
 
-        # Estimate P/E core boundary for Intel hybrid
-        pe_boundary = None
-        if self.cpu_arch == "intel_hybrid":
-            pe_boundary = max(2, (self.physical_cores * 2) // 3)
+        # Prefer topology-derived efficiency classes for Intel hybrid label hints.
+        pe_labels = {}
+        eff_map = (self.topology_snapshot or {}).get("efficiency_class_map_group0", {})
+        if self.cpu_arch == "intel_hybrid" and eff_map:
+            perf_class = min(int(k) for k in eff_map.keys())
+            perf_set = set(int(x) for x in eff_map.get(perf_class, []))
+            for lp in range(self.logical_processors):
+                pe_labels[lp] = "P" if lp in perf_set else "E"
 
         _cols = 8
         for i in range(self.logical_processors):
             var = tk.BooleanVar(value=False)
             self.core_vars.append(var)
 
-            if pe_boundary is not None:
-                badge = "P" if i < pe_boundary else "E"
+            badge = pe_labels.get(i)
+            if badge:
                 label = f"CPU {i}\n[{badge}]"
             else:
                 label = f"CPU {i}"
